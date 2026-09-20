@@ -1,0 +1,11 @@
+node_modules/
+.wrangler/
+wrangler.toml
+*.secret*
+pool_secret*
+key.properties
+*.jks
+*.keystore
+.env
+build/
+.dart_tool/

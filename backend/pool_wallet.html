@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<title>EXL — Havuz Cüzdanı Üretici (lokal, güvenli)</title>
+<style>
+body{font-family:'Segoe UI',sans-serif;background:#060d1a;color:#e9eefb;max-width:760px;margin:0 auto;padding:3rem 1.5rem;line-height:1.6}
+h1{color:#3ee0f0;font-size:1.4rem}
+button{background:#3ee0f0;color:#06121f;border:none;padding:.9rem 2rem;border-radius:10px;font-weight:700;font-size:1rem;cursor:pointer}
+.box{background:#0c1c38;border:1px solid rgba(62,224,240,.3);border-radius:12px;padding:1rem;margin:1rem 0;word-break:break-all;font-family:monospace;font-size:.85rem}
+.warn{color:#f0d9a0;font-size:.9rem}
+label{color:#8fa1c7;font-size:.8rem;letter-spacing:.1em;text-transform:uppercase}
+</style>
+</head>
+<body>
+<h1>Havuz Cüzdanı Üretici</h1>
+<p>Bu sayfa tamamen bilgisayarında çalışır, hiçbir yere veri göndermez. Butona bas:</p>
+<button onclick="gen()">CÜZDAN ÜRET</button>
+<div id="out" style="display:none">
+  <p><label>PUBLIC ADRES → wrangler.toml POOL_ADDRESS</label></p>
+  <div class="box" id="pub"></div>
+  <p><label>SECRET KEY (JSON)</label></p>
+  <div class="box" id="sec"></div>
+  <button onclick="dl()" style="margin-top:.5rem">⬇ SECRET'i pool_secret.txt olarak indir</button>
+  <p class="warn">⚠ İndirilen dosyayı hem wrangler'a vereceğiz hem güvenli bir yere (şifre kasası) yedekle — havuzdaki TÜM paranın anahtarı budur. Kopyala-yapıştır YAPMA, sadece indir.</p>
+</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/tweetnacl/1.0.3/nacl.min.js"></script>
+<script>
+const ABC='123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+function b58(bytes){
+  let n=0n; for(const b of bytes) n=n*256n+BigInt(b);
+  let s=''; while(n>0n){ s=ABC[Number(n%58n)]+s; n/=58n; }
+  for(const b of bytes){ if(b===0) s='1'+s; else break; }
+  return s;
+}
+let _secret='';
+function gen(){
+  const kp=nacl.sign.keyPair();
+  document.getElementById('pub').textContent=b58(kp.publicKey);
+  _secret='['+Array.from(kp.secretKey).join(',')+']';
+  document.getElementById('sec').textContent=_secret;
+  document.getElementById('out').style.display='block';
+}
+function dl(){
+  const blob=new Blob([_secret],{type:'text/plain'});
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(blob);
+  a.download='pool_secret.txt';
+  a.click();
+}
+</script>
+</body>
+</html>

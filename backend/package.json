@@ -1,0 +1,17 @@
+{
+  "name": "exl-tourney-backend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:schema": "wrangler d1 execute exl-tournaments --file=schema.sql --remote"
+  },
+  "dependencies": {
+    "@solana/web3.js": "^1.95.0"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}
