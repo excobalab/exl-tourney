@@ -1,5 +1,6 @@
 // ============================================================================
-// EXL WALLET — EXCOBALAB turnuva ödeme modülü (çift raylı)
+// EXL WALLET v2 — EXCOBALAB turnuva ödeme + imza modülü (çift raylı)
+//   v2 (Eyl 2026, CLOCK IN): SPL token (SKR) ödeme rayı + showExlSignSheet (cüzdan imzalı skor)
 // Card Deck Ex'te onaylanan _ortak/exl_premium.dart deseninin turnuva sürümü.
 //   Ray 1: MWA 2.0 native köprü ("exl/mwa" MethodChannel — MainActivity.kt)
 //          Seeker Wallet, Jupiter, Solflare, Backpack... (imza Uint8List döner)
@@ -19,7 +20,6 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math' as math;
-import 'dart:typed_data';
 
 import 'package:app_links/app_links.dart';
 import 'package:flutter/material.dart';
@@ -44,11 +44,28 @@ const Color exlCyanDim = Color(0x663EE0F0);
 const Color exlIce = Color(0xFFE8F4FF);
 const Color exlPanel = Color(0xFF0C1C38);
 
+// ---- SPL token tanımı (null = SOL) ----
+class ExlToken {
+  final String mint;            // ör. SKR mint
+  final int decimals;           // SKR: 6
+  final String symbol;          // 'SKR'
+  final String destTokenAccount; // alıcının (havuzun) ATA'sı — sunucu /t'den verir
+  const ExlToken({required this.mint, required this.decimals, required this.symbol, required this.destTokenAccount});
+}
+
 // ---- Ödeme sonucu ----
 class PayResult {
   final String txSig;
   final String? wallet; // MWA rayında null; sunucu /join'de türetir
-  const PayResult(this.txSig, [this.wallet]);
+  final String rail;    // 'mwa' | 'phantom'
+  const PayResult(this.txSig, [this.wallet, this.rail = 'mwa']);
+}
+
+// ---- İmza sonucu ----
+class SignResult {
+  final String signature; // base58, 64 bayt ed25519
+  final String wallet;    // imzalayan cüzdan (base58)
+  const SignResult(this.signature, this.wallet);
 }
 
 Future<PayResult?> showExlPaySheet(
@@ -60,6 +77,7 @@ Future<PayResult?> showExlPaySheet(
   required String memo,
   required String title,
   required String subtitle,
+  ExlToken? token, // null = SOL; dolu = SPL token (SKR) — lamports = token base units
 }) {
   return showModalBottomSheet<PayResult>(
     context: context,
@@ -74,7 +92,28 @@ Future<PayResult?> showExlPaySheet(
       memo: memo,
       title: title,
       subtitle: subtitle,
+      token: token,
     ),
+  );
+}
+
+/// Cüzdan imzalı skor: `message` (ör. exl:score:<token>:<score>:<durationMs>) cüzdana
+/// imzalatılır. Kullanıcı atlayabilir (null döner) — skor yine gönderilir, rozet alınmaz.
+Future<SignResult?> showExlSignSheet(
+  BuildContext context, {
+  required String appName,
+  required String phantomScheme,
+  required String message,
+  required int score,
+  String preferRail = 'mwa',
+}) {
+  return showModalBottomSheet<SignResult>(
+    context: context,
+    backgroundColor: Colors.transparent,
+    isScrollControlled: true,
+    isDismissible: true,
+    builder: (_) => _ExlSignSheet(
+        appName: appName, phantomScheme: phantomScheme, message: message, score: score, preferRail: preferRail),
   );
 }
 
@@ -85,6 +124,7 @@ enum _Stage { idle, wallet, approve, confirm }
 class _ExlPaySheet extends StatefulWidget {
   final String appName, phantomScheme, recipient, memo, title, subtitle;
   final int lamports;
+  final ExlToken? token;
   const _ExlPaySheet({
     required this.appName,
     required this.phantomScheme,
@@ -93,6 +133,7 @@ class _ExlPaySheet extends StatefulWidget {
     required this.title,
     required this.subtitle,
     required this.lamports,
+    this.token,
   });
 
   @override
@@ -125,8 +166,14 @@ class _ExlPaySheetState extends State<_ExlPaySheet> {
     super.dispose();
   }
 
-  String get _sol => (widget.lamports / lamportsPerSol)
-      .toStringAsFixed(widget.lamports >= lamportsPerSol ? 2 : 4);
+  String get _amountText {
+    final t = widget.token;
+    if (t != null) {
+      final v = widget.lamports / math.pow(10, t.decimals);
+      return '${v % 1 == 0 ? v.toStringAsFixed(0) : v.toStringAsFixed(2)} ${t.symbol}';
+    }
+    return '${(widget.lamports / lamportsPerSol).toStringAsFixed(widget.lamports >= lamportsPerSol ? 2 : 4)} SOL';
+  }
 
   String get _stageText {
     switch (_stage) {
@@ -164,17 +211,34 @@ class _ExlPaySheetState extends State<_ExlPaySheet> {
         websocketUrl: Uri.parse(exlWsUrl),
       );
 
-  Uint8List _buildUnsignedTx({
+  Future<Uint8List> _buildUnsignedTx({
     required Ed25519HDPublicKey payer,
     required String blockhash,
-  }) {
+  }) async {
     final merchant = Ed25519HDPublicKey.fromBase58(widget.recipient);
-    final message = Message(instructions: [
-      SystemInstruction.transfer(
+    final t = widget.token;
+    final Instruction transferIx;
+    if (t == null) {
+      transferIx = SystemInstruction.transfer(
         fundingAccount: payer,
         recipientAccount: merchant,
         lamports: widget.lamports,
-      ),
+      );
+    } else {
+      // SPL TransferChecked (payer'ın ATA'sı → havuz ATA'sı)
+      final mint = Ed25519HDPublicKey.fromBase58(t.mint);
+      final sourceAta = await findAssociatedTokenAddress(owner: payer, mint: mint);
+      transferIx = TokenInstruction.transferChecked(
+        amount: widget.lamports,
+        decimals: t.decimals,
+        source: sourceAta,
+        mint: mint,
+        destination: Ed25519HDPublicKey.fromBase58(t.destTokenAccount),
+        owner: payer,
+      );
+    }
+    final message = Message(instructions: [
+      transferIx,
       MemoInstruction(signers: [payer], memo: widget.memo),
     ]);
     final compiled = message.compile(recentBlockhash: blockhash, feePayer: payer);
@@ -199,17 +263,21 @@ class _ExlPaySheetState extends State<_ExlPaySheet> {
           () => rpc.rpcClient.getLatestBlockhash().then((it) => it.value.blockhash));
 
       step = 'wallet';
+      final t = widget.token;
       final sigBytes = await exlMwa.invokeMethod<Uint8List>('payPremium', {
         'recipient': widget.recipient,
         'lamports': widget.lamports,
         'memo': widget.memo,
         'blockhash': blockhash,
+        if (t != null) 'mint': t.mint,
+        if (t != null) 'decimals': t.decimals,
+        if (t != null) 'destTokenAccount': t.destTokenAccount,
       });
       if (sigBytes == null) throw Exception('Payment was not approved');
       final sig = base58encode(sigBytes.toList());
 
       step = 'confirm';
-      await _confirmAndFinish(rpc, sig, null); // wallet: sunucu türetir
+      await _confirmAndFinish(rpc, sig, null, 'mwa'); // wallet: sunucu türetir
     } catch (e) {
       _fail(e, step);
     }
@@ -293,7 +361,7 @@ class _ExlPaySheetState extends State<_ExlPaySheet> {
     final blockhash = await _withNetRetry(
         () => rpc.rpcClient.getLatestBlockhash().then((it) => it.value.blockhash));
     final payer = Ed25519HDPublicKey.fromBase58(_phWallet!);
-    final txBytes = _buildUnsignedTx(payer: payer, blockhash: blockhash);
+    final txBytes = await _buildUnsignedTx(payer: payer, blockhash: blockhash);
     final payload = utf8.encode(jsonEncode({
       'transaction': base58encode(txBytes.toList()),
       'session': _phSession,
@@ -323,12 +391,12 @@ class _ExlPaySheetState extends State<_ExlPaySheet> {
     final sig = await _withNetRetry(
         () => rpc.rpcClient.sendTransaction(base64Encode(base58decode(signedB58))));
     _phPending = false;
-    await _confirmAndFinish(rpc, sig, _phWallet);
+    await _confirmAndFinish(rpc, sig, _phWallet, 'phantom');
   }
 
   // ---------------- Ortak son: zincir onayı + PayResult döndür ----------------
 
-  Future<void> _confirmAndFinish(SolanaClient rpc, String sig, String? wallet) async {
+  Future<void> _confirmAndFinish(SolanaClient rpc, String sig, String? wallet, String rail) async {
     if (mounted) setState(() => _stage = _Stage.confirm);
     var confirmed = false;
     for (var i = 0; i < 45 && !confirmed; i++) {
@@ -349,10 +417,10 @@ class _ExlPaySheetState extends State<_ExlPaySheet> {
     }
     if (!confirmed) {
       throw Exception(
-          'Confirmation timed out. If SOL left your wallet, contact info@excobalab.com with tx: $sig');
+          'Confirmation timed out. If funds left your wallet, contact info@excobalab.com with tx: $sig');
     }
     if (!mounted) return;
-    Navigator.of(context).pop(PayResult(sig, wallet));
+    Navigator.of(context).pop(PayResult(sig, wallet, rail));
   }
 
   void _fail(Object e, String step) {
@@ -420,7 +488,7 @@ class _ExlPaySheetState extends State<_ExlPaySheet> {
               textAlign: TextAlign.center,
               style: const TextStyle(color: exlIce, fontSize: 13.5, height: 1.5)),
           const SizedBox(height: 10),
-          Text('$_sol SOL · entry fee',
+          Text('$_amountText · entry fee',
               style: const TextStyle(
                   color: exlCyan,
                   fontSize: 15,
@@ -524,6 +592,200 @@ class _ExlPaySheetState extends State<_ExlPaySheet> {
               style: TextStyle(color: exlCyanDim, fontSize: 10.5, height: 1.5)),
         ],
       ),
+    );
+  }
+}
+
+
+// ---------------------------------------------------------------------------
+// İMZA SAYFASI — cüzdan imzalı skor (MWA signMessages / Phantom signMessage)
+
+class _ExlSignSheet extends StatefulWidget {
+  final String appName, phantomScheme, message, preferRail;
+  final int score;
+  const _ExlSignSheet(
+      {required this.appName, required this.phantomScheme, required this.message, required this.score, required this.preferRail});
+  @override
+  State<_ExlSignSheet> createState() => _ExlSignSheetState();
+}
+
+class _ExlSignSheetState extends State<_ExlSignSheet> {
+  bool _busy = false;
+  String? _error;
+  late final nacl.PrivateKey _phSecret;
+  late final Uint8List _phPub;
+  nacl.Box? _phBox;
+  String? _phSession, _phWallet;
+  StreamSubscription<Uri>? _phSub;
+
+  @override
+  void initState() {
+    super.initState();
+    _phSecret = nacl.PrivateKey.generate();
+    _phPub = Uint8List.fromList(_phSecret.publicKey.toList());
+    _phSub = AppLinks().uriLinkStream.listen(_onPhantomLink, onError: (_) {});
+  }
+
+  @override
+  void dispose() {
+    _phSub?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _signMwa() async {
+    setState(() { _busy = true; _error = null; });
+    try {
+      final r = await exlMwa.invokeMethod<Map>('signScore', {'message': widget.message});
+      if (r == null) throw Exception('Signing was not approved');
+      if (!mounted) return;
+      Navigator.of(context).pop(SignResult(r['signature'] as String, r['wallet'] as String));
+    } catch (e) {
+      _fail(e);
+    }
+  }
+
+  Future<void> _signPhantom() async {
+    setState(() { _busy = true; _error = null; });
+    try {
+      final uri = Uri.https('phantom.app', '/ul/v1/connect', {
+        'app_url': exlSiteUrl,
+        'dapp_encryption_public_key': base58encode(_phPub.toList()),
+        'redirect_link': '${widget.phantomScheme}://phsignconnect',
+        'cluster': 'mainnet-beta',
+      });
+      final ok = await launchUrl(uri, mode: LaunchMode.externalApplication);
+      if (!ok) throw Exception('Phantom is not installed on this device');
+    } catch (e) {
+      _fail(e);
+    }
+  }
+
+  Future<void> _onPhantomLink(Uri uri) async {
+    final p = uri.queryParameters;
+    if (p.containsKey('errorCode')) {
+      _fail(Exception(p['errorCode'] == '4001' ? 'cancelled' : 'Phantom error: ${p['errorMessage'] ?? p['errorCode']}'));
+      return;
+    }
+    try {
+      switch (uri.host.toLowerCase()) {
+        case 'phsignconnect':
+          final phantomPub = base58decode(p['phantom_encryption_public_key']!);
+          _phBox = nacl.Box(myPrivateKey: _phSecret, theirPublicKey: nacl.PublicKey(Uint8List.fromList(phantomPub)));
+          final plain = _phBox!.decrypt(nacl.EncryptedMessage(
+              nonce: Uint8List.fromList(base58decode(p['nonce']!)), cipherText: Uint8List.fromList(base58decode(p['data']!))));
+          final json = jsonDecode(utf8.decode(plain)) as Map;
+          _phSession = json['session'] as String;
+          _phWallet = json['public_key'] as String;
+          // signMessage
+          final payload = utf8.encode(jsonEncode({
+            'message': base58encode(utf8.encode(widget.message)),
+            'session': _phSession,
+            'display': 'utf8',
+          }));
+          final r = math.Random.secure();
+          final nonce = Uint8List.fromList(List.generate(24, (_) => r.nextInt(256)));
+          final sealed = _phBox!.encrypt(Uint8List.fromList(payload), nonce: nonce);
+          final u = Uri.https('phantom.app', '/ul/v1/signMessage', {
+            'dapp_encryption_public_key': base58encode(_phPub.toList()),
+            'nonce': base58encode(nonce.toList()),
+            'redirect_link': '${widget.phantomScheme}://phsigned',
+            'payload': base58encode(Uint8List.fromList(sealed.cipherText).toList()),
+          });
+          await launchUrl(u, mode: LaunchMode.externalApplication);
+          break;
+        case 'phsigned':
+          final plain = _phBox!.decrypt(nacl.EncryptedMessage(
+              nonce: Uint8List.fromList(base58decode(p['nonce']!)), cipherText: Uint8List.fromList(base58decode(p['data']!))));
+          final json = jsonDecode(utf8.decode(plain)) as Map;
+          final sig = json['signature'] as String; // base58
+          if (!mounted) return;
+          Navigator.of(context).pop(SignResult(sig, _phWallet!));
+          break;
+      }
+    } catch (e) {
+      _fail(e);
+    }
+  }
+
+  void _fail(Object e) {
+    if (!mounted) return;
+    final raw = e is PlatformException ? '${e.code}: ${e.message ?? ''}' : e.toString();
+    setState(() {
+      _busy = false;
+      _error = raw.contains('NOWALLET')
+          ? 'No compatible wallet found. Use Phantom or skip.'
+          : (raw.contains('cancel') || raw.contains('declined') || raw.contains('not approved'))
+              ? 'Signing cancelled. You can still submit without a badge.'
+              : raw.replaceFirst('Exception: ', '');
+    });
+  }
+
+  Widget _btn(String title, String sub, bool filled, VoidCallback? onTap) => GestureDetector(
+        onTap: _busy ? null : onTap,
+        child: Container(
+          width: double.infinity,
+          padding: const EdgeInsets.symmetric(vertical: 12),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(14),
+            color: filled && !_busy ? exlCyan : Colors.transparent,
+            border: Border.all(color: filled ? exlCyan : exlCyanDim),
+          ),
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            Text(title,
+                style: TextStyle(
+                    color: filled && !_busy ? exlBgBottom : exlCyan, fontSize: 13, fontWeight: FontWeight.w800, letterSpacing: 2)),
+            const SizedBox(height: 3),
+            Text(sub, style: TextStyle(color: filled && !_busy ? exlBgBottom : exlCyanDim, fontSize: 10)),
+          ]),
+        ),
+      );
+
+  @override
+  Widget build(BuildContext context) {
+    final mwaFirst = widget.preferRail != 'phantom';
+    final mwa = _btn('SIGN WITH MWA WALLET', 'Seeker Wallet · Jupiter · Solflare · Backpack', mwaFirst, _signMwa);
+    final ph = _btn('SIGN WITH PHANTOM', 'in-app approval · encrypted link', !mwaFirst, _signPhantom);
+    return Container(
+      padding: EdgeInsets.fromLTRB(28, 22, 28, 30 + MediaQuery.of(context).viewInsets.bottom),
+      decoration: const BoxDecoration(
+        color: exlPanel,
+        borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
+        border: Border(top: BorderSide(color: exlCyanDim)),
+      ),
+      child: Column(mainAxisSize: MainAxisSize.min, children: [
+        Container(width: 42, height: 4, decoration: BoxDecoration(color: exlCyanDim, borderRadius: BorderRadius.circular(2))),
+        const SizedBox(height: 20),
+        const ExBadge(size: 48),
+        const SizedBox(height: 14),
+        const Text('SIGN YOUR SCORE',
+            style: TextStyle(color: exlCyan, fontSize: 16, fontWeight: FontWeight.w800, letterSpacing: 2)),
+        const SizedBox(height: 8),
+        Text('Score ${widget.score} — your wallet signs it so nobody can submit on your behalf. '
+            'Verified scores get a ✓ badge on the leaderboard and in the tournament proof.',
+            textAlign: TextAlign.center, style: const TextStyle(color: exlIce, fontSize: 13, height: 1.5)),
+        const SizedBox(height: 18),
+        if (_busy)
+          const Padding(
+            padding: EdgeInsets.only(bottom: 12),
+            child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+              SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2, color: exlCyan)),
+              SizedBox(width: 12),
+              Text('Approve in your wallet…', style: TextStyle(color: exlCyan, fontSize: 13, letterSpacing: 1)),
+            ]),
+          ),
+        mwaFirst ? mwa : ph,
+        const SizedBox(height: 10),
+        mwaFirst ? ph : mwa,
+        if (_error != null) ...[
+          const SizedBox(height: 12),
+          Text(_error!, textAlign: TextAlign.center, style: const TextStyle(color: Color(0xFFFF8A8A), fontSize: 12, height: 1.4)),
+        ],
+        const SizedBox(height: 14),
+        GestureDetector(
+          onTap: _busy ? null : () => Navigator.of(context).pop(),
+          child: const Text('SUBMIT WITHOUT SIGNATURE', style: TextStyle(color: exlCyanDim, fontSize: 12, letterSpacing: 1.5)),
+        ),
+      ]),
     );
   }
 }

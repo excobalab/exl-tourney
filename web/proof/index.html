@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EXL Tourney — Tournament Proof</title>
+<meta name="description" content="Audit any EXL Tourney tournament: seed commitment, participants, verified scores and on-chain payouts.">
+<style>
+  :root{--bg:#060D1A;--bg2:#0E2A52;--panel:#0C1C38;--cyan:#3EE0F0;--cyanDim:rgba(62,224,240,.4);--ice:#E8F4FF;--gold:#D4B26A;--green:#7FE0A8;--red:#FF6B6B}
+  *{box-sizing:border-box}
+  body{margin:0;font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color:var(--ice);background:radial-gradient(circle at 50% 20%,var(--bg2),var(--bg) 70%);min-height:100vh}
+  header{display:flex;align-items:center;gap:12px;padding:18px 20px;border-bottom:1px solid var(--cyanDim)}
+  .ex{width:34px;height:34px;border-radius:50%;border:2px solid var(--cyan);display:grid;place-items:center;font-weight:800;font-size:13px;color:var(--ice);background:#0B1B38;box-shadow:0 0 14px rgba(62,224,240,.3)}
+  header h1{font-size:15px;letter-spacing:4px;margin:0;color:var(--cyan)}
+  header a{margin-left:auto;color:var(--cyanDim);font-size:12px;text-decoration:none;letter-spacing:1px}
+  main{max-width:760px;margin:0 auto;padding:18px 16px 60px}
+  .search{display:flex;gap:8px;margin-bottom:16px}
+  .search input{flex:1;background:var(--panel);border:1px solid var(--cyanDim);color:var(--ice);padding:11px 12px;border-radius:12px;font-size:14px;font-family:ui-monospace,monospace}
+  .search button{background:var(--cyan);color:var(--bg);border:0;border-radius:12px;padding:0 18px;font-weight:800;letter-spacing:1px;cursor:pointer}
+  .panel{background:rgba(12,28,56,.85);border:1px solid var(--cyanDim);border-radius:16px;padding:16px;margin-bottom:12px}
+  .h{color:var(--cyan);font-size:12px;letter-spacing:2px;font-weight:800;margin:0 0 8px}
+  .row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .chip{border:1px solid var(--cyanDim);border-radius:8px;padding:2px 8px;font-size:10px;letter-spacing:1px;font-weight:800;color:var(--cyanDim)}
+  .chip.gold{color:var(--gold);border-color:var(--gold)} .chip.cyan{color:var(--cyan);border-color:var(--cyan)} .chip.green{color:var(--green);border-color:var(--green)}
+  .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:12px}
+  .stat b{display:block;font-size:10px;letter-spacing:1.5px;color:var(--cyanDim);font-weight:600}
+  .stat span{font-size:14px;font-weight:700}
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;word-break:break-all;color:var(--ice)}
+  .kv b{display:block;font-size:10px;letter-spacing:1px;color:var(--cyanDim);font-weight:600;margin-top:8px}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  td{padding:8px 6px;border-bottom:1px solid rgba(62,224,240,.12)}
+  td.r{text-align:right;color:var(--cyan);font-weight:800}
+  a{color:var(--cyan)} a.dim{color:var(--cyanDim)}
+  .v{color:var(--green);font-weight:800;font-size:12px}
+  .muted{color:var(--cyanDim);font-size:12px;line-height:1.5}
+  .err{color:var(--red)}
+  footer{text-align:center;color:var(--cyanDim);font-size:11px;letter-spacing:2px;padding:24px}
+  @media (max-width:520px){.stats{grid-template-columns:repeat(2,1fr)}}
+</style>
+</head>
+<body>
+<header><div class="ex">EX</div><h1>TOURNAMENT PROOF</h1><a href="https://web3.excobalab.com/">EXL TOURNEY</a></header>
+<main>
+  <form class="search" onsubmit="go(event)">
+    <input id="id" placeholder="tournament id, e.g. zipla:d:2026-10-01 or zipla:w:2026-W40:skr" autocomplete="off">
+    <button type="submit">VERIFY</button>
+  </form>
+  <div id="out"><p class="muted">Every EXL Tourney tournament is auditable: one server seed for all players (committed while open, revealed after payout), every entry and every prize transaction on Solana. Paste a tournament id or open a proof link from the app.</p></div>
+</main>
+<footer>OPEN SOURCE · github.com/excobalab/exl-tourney · EXCOBALAB</footer>
+<script>
+const API = 'https://exl-tournaments.excobamedikal.workers.dev';
+const $ = s => document.querySelector(s);
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const short = w => w && w.length > 10 ? w.slice(0,4)+'…'+w.slice(-4) : w;
+const amt = (v, cur) => cur === 'SKR' ? (v/1e6).toLocaleString(undefined,{maximumFractionDigits:2})+' SKR' : (v/1e9).toFixed(3)+' SOL';
+const when = ms => ms ? new Date(ms).toISOString().replace('T',' ').slice(0,16)+' UTC' : '—';
+const TYPE = {d:'DAILY', w:'WEEKLY', m:'MONTHLY'};
+
+function go(e){ e.preventDefault(); const id = $('#id').value.trim(); if(!id) return; history.replaceState(null,'','?id='+encodeURIComponent(id)); load(id); }
+
+async function load(id){
+  $('#id').value = id;
+  $('#out').innerHTML = '<p class="muted">Loading…</p>';
+  try{
+    const r = await fetch(API + '/proof?tournamentId=' + encodeURIComponent(id));
+    const d = await r.json();
+    if(!r.ok) throw new Error(d.error || 'Server error');
+    render(d);
+  }catch(err){ $('#out').innerHTML = '<p class="err">'+esc(err.message)+'</p>'; }
+}
+
+function render(d){
+  const t = d.tournament, cur = t.currency || 'SOL', st = t.status;
+  const rk = d.ranking || [], po = d.payouts || [];
+  let h = '';
+  h += `<div class="panel"><div class="row"><span style="font-size:16px;font-weight:800;letter-spacing:3px;color:${cur==='SKR'?'var(--gold)':'var(--cyan)'}">${TYPE[t.type]||t.type}</span>
+        <span class="chip ${cur==='SKR'?'gold':'cyan'}">${cur}</span><span class="chip ${st==='paid'?'green':(st==='open'?'cyan':'')}">${esc(st.toUpperCase())}</span>
+        <span style="margin-left:auto" class="mono">${esc(t.id)}</span></div>
+        <div class="stats"><div class="stat"><b>POOL</b><span>${amt(d.pool,cur)}</span></div><div class="stat"><b>PLAYERS</b><span>${d.participants}</span></div>
+        <div class="stat"><b>ENTRY</b><span>${amt(t.feeAmount,cur)}</span></div><div class="stat"><b>SERVICE FEE</b><span>${t.feePct}%</span></div></div>
+        <p class="muted" style="margin:10px 0 0">${when(t.startsAt)} → ${when(t.endsAt)} · attempts per player: ${t.attemptsMax}</p></div>`;
+  h += `<div class="panel"><p class="h">SAME RUN FOR EVERYONE</p><p class="muted" style="margin:0 0 6px">All participants play the run generated from one server seed. Its SHA-256 commitment is public while the tournament is open; the seed itself is revealed after settlement — recompute <span class="mono">sha256(seed)</span> and compare.</p>
+        <div class="kv"><b>SEED COMMITMENT (SHA-256)</b><div class="mono">${esc(d.seedCommitment)}</div>
+        <b>REVEALED SEED</b><div class="mono">${d.seed ? esc(d.seed) : '<span class="muted">revealed after payout</span>'}</div></div></div>`;
+  h += `<div class="panel"><p class="h">RANKING</p>` + (rk.length ? `<table>${rk.map(r =>
+        `<tr><td style="width:40px;font-weight:800">${r.rank ?? '—'}</td><td><a class="dim" href="https://solscan.io/tx/${esc(r.entryTx)}" target="_blank" rel="noopener">${esc(short(r.wallet))}</a> <span class="muted">entry tx ↗</span></td>
+         <td>${r.verified ? '<span class="v">✓ verified</span>' : ''}</td><td class="r">${r.score || '<span class="muted">no score</span>'}</td></tr>`).join('')}</table>`
+        : '<p class="muted">No participants yet.</p>') + `</div>`;
+  h += `<div class="panel"><p class="h">PAYOUTS</p>` + (po.length ? `<table>${po.map(p =>
+        `<tr><td style="width:110px;font-weight:700;color:${p.role==='service_fee'?'var(--cyanDim)':'var(--ice)'}">${p.role==='service_fee'?'Service fee':'Prize #'+p.rank}</td>
+         <td class="muted">${esc(short(p.wallet))}</td><td class="r">${amt(p.amount,cur)}</td>
+         <td style="width:60px">${p.explorer ? `<a href="${esc(p.explorer)}" target="_blank" rel="noopener">TX ↗</a>` : '<span class="muted">dry-run</span>'}</td></tr>`).join('')}</table>`
+        : `<p class="muted">${st==='paid' ? 'No prizes were due (no valid scores).' : 'Paid automatically when the tournament ends.'}</p>`)
+        + `<p class="muted" style="margin:10px 0 0">Prize pool wallet: <a href="https://solscan.io/account/${esc(d.poolAddress)}" target="_blank" rel="noopener">${esc(short(d.poolAddress))}</a></p></div>`;
+  h += `<div class="panel"><p class="h">RULES</p><p class="muted" style="margin:0">${esc(d.rules||'')}</p></div>`;
+  $('#out').innerHTML = h;
+}
+const q = new URLSearchParams(location.search).get('id'); if (q) load(q);
+</script>
+</body>
+</html>

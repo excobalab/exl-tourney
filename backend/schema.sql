@@ -1,13 +1,13 @@
--- EXL Tournaments — D1 schema v2 (fresh install). Existing v1 databases: run migrations/0002_skr_and_signatures.sql instead.
+-- EXL Tournaments — D1 schema v2.0 (fresh install). Existing databases: run migrations/0002_*.sql then migrations/0003_duels.sql instead.
 CREATE TABLE IF NOT EXISTS tournaments (
   id TEXT PRIMARY KEY,              -- zipla:d:2026-07-12 | zipla:w:2026-W28 | zipla:m:2026-07
   game TEXT NOT NULL,
-  type TEXT NOT NULL,               -- d | w | m
+  type TEXT NOT NULL,               -- d | w | m | x (duel room)
   starts_at INTEGER NOT NULL,       -- unix ms (UTC)
   ends_at INTEGER NOT NULL,
   fee_lamports INTEGER NOT NULL,    -- base units of `currency` (lamports for SOL, 1e-6 SKR for SKR)
   currency TEXT NOT NULL DEFAULT 'SOL',  -- SOL | SKR
-  status TEXT NOT NULL DEFAULT 'open'   -- open | settling | paid
+  status TEXT NOT NULL DEFAULT 'open'   -- open | settling | paid  (duels: pending | open | live | settling | paid | cancelled)
 );
 
 CREATE TABLE IF NOT EXISTS entries (
@@ -41,7 +41,7 @@ CREATE TABLE IF NOT EXISTS attempts (
 CREATE TABLE IF NOT EXISTS payouts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   tournament_id TEXT NOT NULL,
-  rank INTEGER NOT NULL,            -- 0 = komisyon
+  rank INTEGER NOT NULL,            -- 0 = service fee, -1 = refund (cancelled duel)
   wallet TEXT NOT NULL,
   lamports INTEGER NOT NULL,
   tx_sig TEXT,
@@ -51,3 +51,18 @@ CREATE TABLE IF NOT EXISTS payouts (
 CREATE INDEX IF NOT EXISTS idx_entries_t ON entries(tournament_id, best_score DESC, best_at ASC);
 CREATE INDEX IF NOT EXISTS idx_attempts_e ON attempts(entry_id);
 CREATE INDEX IF NOT EXISTS idx_tourn_status ON tournaments(status, ends_at);
+
+-- v2.0 DUEL / ROOM mode: room settings for tournaments rows with type='x'
+CREATE TABLE IF NOT EXISTS duels (
+  id TEXT PRIMARY KEY,               -- <game>:x:<CODE>  (CODE = 6-char invite code)
+  max_players INTEGER NOT NULL,      -- 2..10
+  join_ms INTEGER NOT NULL,
+  play_ms INTEGER NOT NULL,
+  join_ends_at INTEGER NOT NULL,
+  live_at INTEGER,
+  dist TEXT NOT NULL,                -- wta | top2 | top3 | half
+  visibility TEXT NOT NULL,          -- public | private
+  created_by TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_tourn_game_type ON tournaments(game, type, status);

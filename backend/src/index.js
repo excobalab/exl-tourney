@@ -4,6 +4,8 @@
 //   • SKR tournaments (SPL token entry fees + payouts)           [docs/SKR.md]
 //   • wallet-signed scores (ed25519, "verified" badge)           [docs/ANTI_CHEAT.md]
 //   • /proof endpoint (auditable tournament summary)             [docs/API.md]
+// v2.0 (Oct 2026):
+//   • DUEL / ROOM mode — player-created rooms, own stake & windows  [docs/DUELS.md]
 // ============================================================================
 import { Keypair, PublicKey, SystemProgram, Transaction, TransactionInstruction } from '@solana/web3.js';
 import bs58 from 'bs58';
@@ -23,7 +25,7 @@ const SKR_FEES = { d: 500 * SKR_UNIT, w: 1_500 * SKR_UNIT, m: 5_000 * SKR_UNIT }
 // Launch mode (LAUNCH_MODE="1"): 0.01 SOL / 50 SKR daily — for onboarding the first players.
 const LAUNCH_FEES = { d: 10_000_000, w: 30_000_000, m: 100_000_000 };
 const LAUNCH_SKR_FEES = { d: 50 * SKR_UNIT, w: 150 * SKR_UNIT, m: 500 * SKR_UNIT };
-const STD_ATTEMPTS = { d: 1, w: 3, m: 10 };
+const STD_ATTEMPTS = { d: 1, w: 3, m: 10, x: 1 }; // x = duel room (single attempt)
 const GAMES = {
   // Deterministic score formula (SOL JUMP): dist = v0*t + (acc/2)*t^2 ; score = floor(dist/div)
   zipla:  { minDurationMs: 700,  physics: { v0: 260, acc: 8, scoreDiv: 10 } },
@@ -48,6 +50,41 @@ function expectedScore(cfg, durationMs) {
 }
 const FEE_PCT = { d: 1, w: 3, m: 5 };
 const WEIGHTS = { d: [99], w: [50, 30, 17], m: [30, 18, 12, 9, 7, 6, 5, 4, 2, 2] }; // sum + FEE_PCT = 100
+
+// ---- DUEL / ROOM mode (type 'x') ----
+// Service fee: 3 % on SOL rooms, 5 % on SKR rooms (SKR payouts may need an ATA rent paid in SOL).
+const DUEL_FEE_PCT = { SOL: 3, SKR: 5 };
+const DUEL_STAKE = { SOL: { min: 20_000_000, max: 5_000_000_000 }, SKR: { min: 200 * SKR_UNIT, max: 50_000 * SKR_UNIT } };
+const DUEL_WINDOWS_MIN = [15, 60, 360, 1440];          // joining / playing window options (minutes)
+const DUEL_PLAYERS = { min: 2, max: 10 };
+const DUEL_DIST = { wta: 'Winner takes all', top2: 'Top 2 · 70/30', top3: 'Top 3 · 50/30/20', half: 'Top half split equally' };
+const DUEL_PENDING_MS = 15 * 60 * 1000;                 // unpaid room reservations expire after 15 min
+const DUEL_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+function duelCode() { const a = crypto.getRandomValues(new Uint8Array(6)); return [...a].map(b => DUEL_CODE_ALPHABET[b % DUEL_CODE_ALPHABET.length]).join(''); }
+const isDuel = tr => tr.type === 'x';
+function feePctFor(tr) { return isDuel(tr) ? DUEL_FEE_PCT[tr.currency || 'SOL'] : FEE_PCT[tr.type]; }
+// Prize weights (percent of the payable pool) for a room with `n` scored players.
+function duelWeights(dist, n) {
+  if (n <= 0) return [];
+  if (dist === 'top2') return n >= 2 ? [70, 30] : [100];
+  if (dist === 'top3') return n >= 3 ? [50, 30, 20] : (n === 2 ? [70, 30] : [100]);
+  if (dist === 'half') { const k = Math.max(1, Math.floor(n / 2)); return Array(k).fill(100 / k); }
+  return [100]; // wta
+}
+// Shares in base units; tied scores split the weights of the positions they occupy equally.
+function duelShares(payable, dist, ranked) {
+  const w = duelWeights(dist, ranked.length);
+  const pos = ranked.map((_, i) => (i < w.length ? payable * w[i] / 100 : 0));
+  const out = new Array(ranked.length).fill(0);
+  let i = 0;
+  while (i < ranked.length) {
+    let j = i; while (j + 1 < ranked.length && ranked[j + 1].best_score === ranked[i].best_score) j++;
+    const sum = pos.slice(i, j + 1).reduce((a, b) => a + b, 0);
+    for (let k = i; k <= j; k++) out[k] = Math.floor(sum / (j - i + 1));
+    i = j + 1;
+  }
+  return out;
+}
 const SUBMIT_WINDOW_MS = 24 * 3600 * 1000;
 
 // ---- helpers ----
@@ -71,10 +108,22 @@ function ataFor(owner, mint) {
     [new PublicKey(owner).toBytes(), TOKEN_PROGRAM.toBytes(), new PublicKey(mint).toBytes()], ATA_PROGRAM,
   )[0];
 }
+// RPC with failover: RPC_URL may hold several endpoints separated by commas. A network error,
+// an HTTP error or a JSON-RPC server error (-32xxx, e.g. node behind / rate limited) moves to the next.
 async function rpc(env, method, params) {
-  const r = await fetch(env.RPC_URL, { method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) });
-  return r.json();
+  const urls = String(env.RPC_URL || '').split(',').map(u => u.trim()).filter(Boolean);
+  let last = { error: { message: 'no RPC_URL configured' } };
+  for (const url of urls) {
+    try {
+      const r = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) });
+      if (!r.ok) { last = { error: { message: `HTTP ${r.status} from ${url}` } }; continue; }
+      const j = await r.json();
+      if (j.error && (j.error.code <= -32000 && j.error.code >= -32099 || j.error.code === 429)) { last = j; continue; }
+      return j;
+    } catch (e) { last = { error: { message: String(e) } }; }
+  }
+  return last;
 }
 
 // UTC period ids and bounds
@@ -119,6 +168,35 @@ async function seedFor(env, tournamentId) {
 async function sha256hex(s) {
   const h = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
   return [...new Uint8Array(h)].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// ---- USD reference prices (informational only — payments are always in SOL/SKR) ----
+// Jupiter price API by mint (works for any Solana token incl. SKR), CoinGecko as fallback for SOL.
+// Cached in the Worker for 5 minutes so thousands of phones never hit the price APIs directly.
+const SOL_MINT = 'So11111111111111111111111111111111111111112';
+const PRICE_TTL_MS = 5 * 60 * 1000;
+let _priceCache = { at: 0, prices: null };
+async function getPrices(env) {
+  if (now() - _priceCache.at < PRICE_TTL_MS && _priceCache.prices) return _priceCache.prices;
+  const out = { SOL: null, SKR: null, at: now(), source: null };
+  try {
+    const ids = [SOL_MINT, env.SKR_MINT].filter(Boolean).join(',');
+    const r = await fetch(`https://lite-api.jup.ag/price/v3?ids=${ids}`, { signal: AbortSignal.timeout(4000) });
+    if (r.ok) {
+      const j = await r.json();
+      const pick = m => { const v = j?.[m] ?? j?.data?.[m]; const p = Number(v?.usdPrice ?? v?.price); return Number.isFinite(p) && p > 0 ? p : null; };
+      out.SOL = pick(SOL_MINT); out.SKR = env.SKR_MINT ? pick(env.SKR_MINT) : null; out.source = 'jupiter';
+    }
+  } catch (_) { /* fall through */ }
+  if (!out.SOL) {
+    try {
+      const r = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd', { signal: AbortSignal.timeout(4000) });
+      if (r.ok) { const p = Number((await r.json())?.solana?.usd); if (p > 0) { out.SOL = p; out.source = out.source ? out.source + '+coingecko' : 'coingecko'; } }
+    } catch (_) { /* ignore */ }
+  }
+  if (out.SOL || out.SKR) _priceCache = { at: now(), prices: out };
+  else if (_priceCache.prices) return _priceCache.prices; // stale is better than nothing
+  return out;
 }
 
 // ---- Wallet-signed scores: ed25519 over `exl:score:<token>:<score>:<durationMs>` ----
@@ -236,7 +314,7 @@ async function handleTournaments(env, url) {
   await ensureTournaments(env, game);
   const t = now();
   const rows = (await env.DB.prepare(
-    `SELECT * FROM tournaments WHERE game=? AND status='open' AND starts_at<=? AND ends_at>? AND (currency='SOL' OR ?=1) ORDER BY ends_at, currency`
+    `SELECT * FROM tournaments WHERE game=? AND type<>'x' AND status='open' AND starts_at<=? AND ends_at>? AND (currency='SOL' OR ?=1) ORDER BY ends_at, currency`
   ).bind(game, t, t, wantSkr ? 1 : 0).all()).results;
 
   const out = [];
@@ -250,7 +328,7 @@ async function handleTournaments(env, url) {
     out.push({
       id: r.id, type: r.type, currency: r.currency || 'SOL', endsAt: r.ends_at,
       feeLamports: r.fee_lamports, feeAmount: r.fee_lamports,   // base units of `currency`
-      participants: agg.c, poolLamports: agg.pool, poolAmount: agg.pool, feePct: FEE_PCT[r.type],
+      participants: agg.c, poolLamports: agg.pool, poolAmount: agg.pool, feePct: feePctFor(r),
       attemptsMax: GAMES[r.game].attempts[r.type], me,
     });
   }
@@ -258,6 +336,7 @@ async function handleTournaments(env, url) {
     poolAddress: env.POOL_ADDRESS,
     skr: wantSkr ? { mint: env.SKR_MINT, decimals: SKR_DECIMALS, poolTokenAccount: ataFor(env.POOL_ADDRESS, env.SKR_MINT).toBase58() } : null,
     tournaments: out,
+    prices: await getPrices(env),   // USD reference (≈), informational only
   });
 }
 
@@ -265,11 +344,26 @@ async function handleJoin(env, body) {
   const { tournamentId, wallet, payTx } = body || {};
   if (!tournamentId || !payTx) return bad('tournamentId, payTx required');
   const tr = await env.DB.prepare(`SELECT * FROM tournaments WHERE id=?`).bind(tournamentId).first();
-  if (!tr || tr.status !== 'open' || tr.ends_at <= now()) return bad('Tournament is not open');
+  if (!tr) return bad('Tournament is not open');
+  let duel = null;
+  if (isDuel(tr)) {
+    duel = await env.DB.prepare(`SELECT * FROM duels WHERE id=?`).bind(tr.id).first();
+    if (!duel) return bad('Unknown room', 404);
+    if (tr.status === 'pending') {
+      // created_by may be the placeholder 'new' when the creator had no wallet linked yet — the first payer becomes the creator
+      if (wallet && duel.created_by !== 'new' && wallet !== duel.created_by) return bad('Room is not open yet', 403);
+    } else if (tr.status !== 'open' || duel.join_ends_at <= now()) return bad('Room is not open for joining');
+    const cnt = (await env.DB.prepare(`SELECT COUNT(*) c FROM entries WHERE tournament_id=?`).bind(tr.id).first()).c;
+    if (cnt >= duel.max_players) return bad('Room is full', 409);
+  } else if (tr.status !== 'open' || tr.ends_at <= now()) return bad('Tournament is not open');
 
   const v = await verifyPayment(env, payTx, wallet || null, tr);
   if (v.err) return bad(v.err, 402);
   const payer = v.payer;
+  if (duel && tr.status === 'pending') {
+    if (duel.created_by === 'new') { await env.DB.prepare(`UPDATE duels SET created_by=? WHERE id=?`).bind(payer, tr.id).run(); duel.created_by = payer; }
+    else if (payer !== duel.created_by) return bad('Room is not open yet', 403);
+  }
 
   try {
     await env.DB.prepare(`INSERT INTO entries (tournament_id, wallet, pay_tx, paid_lamports, joined_at) VALUES (?,?,?,?,?)`)
@@ -281,17 +375,24 @@ async function handleJoin(env, body) {
     throw e;
   }
   const agg = await env.DB.prepare(`SELECT COUNT(*) c, COALESCE(SUM(paid_lamports),0) p FROM entries WHERE tournament_id=?`).bind(tournamentId).first();
+  let roomStatus = tr.status;
+  if (duel) {
+    if (tr.status === 'pending') { await env.DB.prepare(`UPDATE tournaments SET status='open' WHERE id=?`).bind(tr.id).run(); roomStatus = 'open'; }
+    if (agg.c >= duel.max_players) { await duelGoLive(env, tr.id, duel.play_ms); roomStatus = 'live'; }
+  }
   await tgBildir(env,
     `🏆 YENİ KATILIM\n${tournamentId}\nCüzdan: ${payer.slice(0, 4)}…${payer.slice(-4)}\n` +
     `Ücret: ${fmtAmount(tr.fee_lamports, tr.currency)}\nToplam: ${agg.c} katılımcı · havuz ${fmtAmount(agg.p, tr.currency)}`);
-  return J({ ok: true, wallet: payer, attemptsMax: GAMES[tr.game].attempts[tr.type] });
+  return J({ ok: true, wallet: payer, attemptsMax: GAMES[tr.game].attempts[tr.type], status: roomStatus });
 }
 
 async function handleAttemptStart(env, body) {
   const { tournamentId, wallet } = body || {};
   if (!tournamentId || !wallet) return bad('tournamentId, wallet required');
   const tr = await env.DB.prepare(`SELECT * FROM tournaments WHERE id=?`).bind(tournamentId).first();
-  if (!tr || tr.status !== 'open' || tr.ends_at <= now()) return bad('Tournament is not open');
+  if (!tr) return bad('Tournament is not open');
+  if (isDuel(tr)) { if (tr.status !== 'live' || tr.ends_at <= now()) return bad(tr.status === 'open' || tr.status === 'pending' ? 'Room has not started yet' : 'Room is closed', 409); }
+  else if (tr.status !== 'open' || tr.ends_at <= now()) return bad('Tournament is not open');
   const entry = await env.DB.prepare(`SELECT * FROM entries WHERE tournament_id=? AND wallet=?`).bind(tournamentId, wallet).first();
   if (!entry) return bad('Join the tournament first', 403);
   const maxA = GAMES[tr.game].attempts[tr.type];
@@ -333,25 +434,25 @@ async function handleSubmit(env, body) {
     if (score > cfg.maxScorePerSec * (dur / 1000) + 10) flagged = 1;
   }
 
-  // Optional wallet signature → "verified" badge. Unsigned submissions still count (backwards compatible).
-  let verified = 0;
+  // Optional wallet signature → "verified" badge. Unsigned or badly-signed submissions still count
+  // (the score is already bound to a burned attempt token); they just don't get the badge.
+  let verified = 0, signatureValid = null;
   if (signature) {
-    if (wallet && wallet !== entry.wallet) return bad('Signature wallet does not match entry', 403);
-    const ok = await verifyScoreSignature(entry.wallet, `exl:score:${token}:${score}:${dur}`, signature);
-    if (!ok) return bad('Invalid score signature', 403);
-    verified = 1;
+    const sameWallet = !wallet || wallet === entry.wallet;
+    signatureValid = sameWallet && await verifyScoreSignature(entry.wallet, `exl:score:${token}:${score}:${dur}`, signature);
+    verified = signatureValid ? 1 : 0;
   }
 
   await env.DB.prepare(
     `UPDATE attempts SET submitted_at=?, score=?, duration_ms=?, taps=?, flagged=?, telemetry_json=?, sig=?, verified=? WHERE token=?`
-  ).bind(now(), score, dur, Number(taps) || 0, flagged, JSON.stringify(samples || null), signature || null, verified, token).run();
+  ).bind(now(), score, dur, Number(taps) || 0, flagged, JSON.stringify(samples || null), verified ? signature : null, verified, token).run();
 
   let newBest = false;
   if (!flagged && score > entry.best_score) {
     await env.DB.prepare(`UPDATE entries SET best_score=?, best_at=?, best_verified=? WHERE id=?`).bind(score, now(), verified, entry.id).run();
     newBest = true;
   }
-  return J({ ok: true, accepted: !flagged, newBest, verified: !!verified });
+  return J({ ok: true, accepted: !flagged, newBest, verified: !!verified, signatureValid });
 }
 
 async function handleLeaderboard(env, url) {
@@ -388,6 +489,7 @@ async function handleProof(env, url) {
   if (!id) return bad('tournamentId required');
   const tr = await env.DB.prepare(`SELECT * FROM tournaments WHERE id=?`).bind(id).first();
   if (!tr) return bad('Unknown tournament', 404);
+  const duel = isDuel(tr) ? await env.DB.prepare(`SELECT * FROM duels WHERE id=?`).bind(id).first() : null;
   const entries = (await env.DB.prepare(
     `SELECT wallet, pay_tx, paid_lamports, joined_at, attempts_used, best_score, best_at, best_verified
        FROM entries WHERE tournament_id=? ORDER BY best_score DESC, best_at ASC`
@@ -398,9 +500,12 @@ async function handleProof(env, url) {
   let rank = 0;
   return J({
     tournament: { id, game: tr.game, type: tr.type, currency: tr.currency || 'SOL', startsAt: tr.starts_at, endsAt: tr.ends_at,
-                  feeAmount: tr.fee_lamports, feePct: FEE_PCT[tr.type], status: tr.status, attemptsMax: GAMES[tr.game].attempts[tr.type] },
+                  feeAmount: tr.fee_lamports, feePct: feePctFor(tr), status: tr.status, attemptsMax: GAMES[tr.game].attempts[tr.type] },
+    duel: duel ? { code: id.split(':')[2], maxPlayers: duel.max_players, joinEndsAt: duel.join_ends_at, liveAt: duel.live_at, playMs: duel.play_ms,
+                   dist: duel.dist, distLabel: DUEL_DIST[duel.dist], visibility: duel.visibility, createdBy: duel.created_by,
+                   weights: duelWeights(duel.dist, Math.max(1, entries.filter(e => e.best_score > 0).length)) } : null,
     // The seed itself is revealed once the tournament is settled; before that only its SHA-256 commitment is public.
-    seed: tr.status === 'paid' ? seed : null,
+    seed: tr.status === 'paid' || tr.status === 'cancelled' ? seed : null,
     seedCommitment: await sha256hex(seed),
     poolAddress: env.POOL_ADDRESS,
     pool, participants: entries.length,
@@ -409,10 +514,12 @@ async function handleProof(env, url) {
       attemptsUsed: e.attempts_used, entryTx: e.pay_tx, joinedAt: e.joined_at,
     })),
     payouts: payouts.map(p => ({
-      rank: p.rank, role: p.rank === 0 ? 'service_fee' : 'prize', wallet: p.wallet, amount: p.lamports, txSig: p.tx_sig, paidAt: p.paid_at,
+      rank: p.rank, role: p.rank === 0 ? 'service_fee' : (p.rank < 0 ? 'refund' : 'prize'), wallet: p.wallet, amount: p.lamports, txSig: p.tx_sig, paidAt: p.paid_at,
       explorer: p.tx_sig && p.tx_sig !== 'DRY_RUN' ? `https://solscan.io/tx/${p.tx_sig}` : null,
     })),
-    rules: 'Same server seed for every participant; ties → earlier submission wins; flagged scores never rank; the payout transaction fee is deducted from the service fee, never from prizes.',
+    rules: duel
+      ? 'Room rules: one attempt each, same seed for everyone, the playing clock starts for all players at once; ties split the prize equally; flagged scores never rank; fewer than 2 players or no valid score → full refund minus the on-chain fee; the payout transaction fee is deducted from the service fee, never from prizes.'
+      : 'Same server seed for every participant; ties → earlier submission wins; flagged scores never rank; the payout transaction fee is deducted from the service fee, never from prizes.',
   });
 }
 
@@ -422,7 +529,7 @@ async function accountExists(env, pubkey) {
 }
 function u64le(n) { const b = new Uint8Array(8); let x = BigInt(n); for (let i = 0; i < 8; i++) { b[i] = Number(x & 0xffn); x >>= 8n; } return b; }
 
-async function buildPayoutIxs(env, kp, tr, transfers) {
+async function buildPayoutIxs(env, kp, tr, transfers, memoSuffix = 'payout') {
   const ixs = [];
   if (tr.currency !== 'SKR') {
     for (const t of transfers) ixs.push(SystemProgram.transfer({ fromPubkey: kp.publicKey, toPubkey: new PublicKey(t.to), lamports: t.lamports }));
@@ -462,15 +569,93 @@ async function buildPayoutIxs(env, kp, tr, transfers) {
   // Memo on every payout tx: anyone can see which tournament it settled
   ixs.push(new TransactionInstruction({
     programId: MEMO_PROGRAM, keys: [{ pubkey: kp.publicKey, isSigner: true, isWritable: false }],
-    data: new TextEncoder().encode(`${tr.id}:payout`),
+    data: new TextEncoder().encode(`${tr.id}:${memoSuffix}`),
   }));
   return ixs;
 }
 
+// Signs + sends one payout/refund transaction from the pool wallet; returns the signature ('DRY_RUN' when simulating).
+async function sendTransfers(env, tr, transfers, memoSuffix) {
+  if (env.DRY_RUN === '1') return 'DRY_RUN';
+  const kp = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(env.POOL_SECRET)));
+  const blockhash = (await rpc(env, 'getLatestBlockhash', [{ commitment: 'confirmed' }])).result?.value?.blockhash;
+  if (!blockhash) throw new Error('Failed to fetch blockhash for payout');
+  const tx = new Transaction();
+  tx.recentBlockhash = blockhash;
+  tx.feePayer = kp.publicKey;
+  for (const ix of await buildPayoutIxs(env, kp, tr, transfers, memoSuffix)) tx.add(ix);
+  tx.sign(kp);
+  let bin = ''; for (const b of tx.serialize()) bin += String.fromCharCode(b);
+  const sendJson = await rpc(env, 'sendTransaction', [btoa(bin), { encoding: 'base64', preflightCommitment: 'confirmed' }]);
+  if (sendJson.error) throw new Error('sendTransaction: ' + JSON.stringify(sendJson.error));
+  if (!sendJson.result) throw new Error('sendTransaction returned no signature');
+  return sendJson.result;
+}
+
+// ---- Duel lifecycle ----
+async function duelGoLive(env, id, playMs) {
+  const t = now();
+  const r = await env.DB.prepare(`UPDATE tournaments SET status='live', starts_at=?, ends_at=? WHERE id=? AND status='open'`).bind(t, t + playMs, id).run();
+  if (r.meta.changes) {
+    await env.DB.prepare(`UPDATE duels SET live_at=? WHERE id=?`).bind(t, id).run();
+    await tgBildir(env, `⚔️ DÜELLO BAŞLADI\n${id}\nSüre: ${Math.round(playMs / 60000)} dk`);
+  }
+  return !!r.meta.changes;
+}
+
+// Full refund to every entry (minus the on-chain tx fee, split evenly on SOL rooms); room → cancelled.
+async function duelRefund(env, tr, reason) {
+  const entries = (await env.DB.prepare(`SELECT wallet, paid_lamports FROM entries WHERE tournament_id=?`).bind(tr.id).all()).results;
+  let sig = null;
+  if (entries.length) {
+    const per = tr.currency === 'SKR' ? 0 : Math.ceil(5000 / entries.length);
+    const transfers = entries.map(e => ({ to: e.wallet, lamports: Math.max(0, e.paid_lamports - per), rank: -1 })).filter(t => t.lamports > 0);
+    sig = await sendTransfers(env, tr, transfers, 'refund');
+    for (const t of transfers) {
+      await env.DB.prepare(`INSERT INTO payouts (tournament_id, rank, wallet, lamports, tx_sig, paid_at) VALUES (?,?,?,?,?,?)`)
+        .bind(tr.id, -1, t.to, t.lamports, sig, now()).run();
+    }
+  }
+  await env.DB.prepare(`UPDATE tournaments SET status='cancelled' WHERE id=?`).bind(tr.id).run();
+  await tgBildir(env, `↩️ DÜELLO İPTAL (${reason})\n${tr.id}\n${entries.length} iade · tx ${sig}`);
+  return { id: tr.id, cancelled: reason, refunds: entries.length, sig };
+}
+
+// Runs every cron tick: expire unpaid reservations, start or cancel rooms whose joining window closed.
+async function duelTick(env) {
+  const t = now();
+  const report = [];
+  const stale = (await env.DB.prepare(`SELECT id FROM tournaments WHERE type='x' AND status='pending' AND starts_at<?`).bind(t - DUEL_PENDING_MS).all()).results;
+  for (const r of stale) {
+    await env.DB.prepare(`DELETE FROM duels WHERE id=?`).bind(r.id).run();
+    await env.DB.prepare(`DELETE FROM tournaments WHERE id=? AND status='pending'`).bind(r.id).run();
+  }
+  const closing = (await env.DB.prepare(
+    `SELECT t.*, d.join_ends_at, d.play_ms FROM tournaments t JOIN duels d ON d.id=t.id WHERE t.type='x' AND t.status='open' AND d.join_ends_at<=?`
+  ).bind(t).all()).results;
+  for (const tr of closing) {
+    const c = (await env.DB.prepare(`SELECT COUNT(*) c FROM entries WHERE tournament_id=?`).bind(tr.id).first()).c;
+    try {
+      if (c >= DUEL_PLAYERS.min) { await duelGoLive(env, tr.id, tr.play_ms); report.push({ id: tr.id, live: true, players: c }); }
+      else {
+        await env.DB.prepare(`UPDATE tournaments SET status='settling' WHERE id=?`).bind(tr.id).run();
+        report.push(await duelRefund(env, tr, 'not enough players'));
+      }
+    } catch (e) {
+      await env.DB.prepare(`UPDATE tournaments SET status='open' WHERE id=? AND status='settling'`).bind(tr.id).run();
+      report.push({ id: tr.id, error: String(e) });
+    }
+  }
+  return report;
+}
+
 async function settle(env) {
-  const due = (await env.DB.prepare(`SELECT * FROM tournaments WHERE status='open' AND ends_at<=?`).bind(now()).all()).results;
+  const due = (await env.DB.prepare(
+    `SELECT * FROM tournaments WHERE ((status='open' AND type<>'x') OR (status='live' AND type='x')) AND ends_at<=?`
+  ).bind(now()).all()).results;
   const report = [];
   for (const tr of due) {
+    const wasStatus = tr.status;
     await env.DB.prepare(`UPDATE tournaments SET status='settling' WHERE id=?`).bind(tr.id).run();
     try {
       // IDEMPOTENCY GUARD: payouts already recorded → never pay twice
@@ -484,17 +669,27 @@ async function settle(env) {
       const ranked = (await env.DB.prepare(
         `SELECT wallet, best_score, best_at FROM entries WHERE tournament_id=? AND best_score>0 ORDER BY best_score DESC, best_at ASC LIMIT 10`
       ).bind(tr.id).all()).results;
+      const duel = isDuel(tr) ? await env.DB.prepare(`SELECT * FROM duels WHERE id=?`).bind(tr.id).first() : null;
 
+      if (duel && ranked.length === 0) {
+        // Nobody played → everyone gets their stake back (minus the on-chain fee)
+        report.push(await duelRefund(env, tr, 'no valid score'));
+        continue;
+      }
       if (pool > 0) {
         const isSkr = tr.currency === 'SKR';
         // SOL: the payout tx fee (5000 lamports) comes out of the service fee. SKR: fee is paid in SOL from the pool wallet's balance.
         const TX_FEE = isSkr ? 0 : 5000;
         let transfers;
         if (ranked.length > 0) {
-          const weights = WEIGHTS[tr.type].slice(0, ranked.length);
-          const sumW = weights.reduce((a, b) => a + b, 0);
-          const payable = Math.floor(pool * (100 - FEE_PCT[tr.type]) / 100);
-          const shares = weights.map(w => Math.floor(payable * w / sumW));
+          const payable = Math.floor(pool * (100 - feePctFor(tr)) / 100);
+          let shares;
+          if (duel) shares = duelShares(payable, duel.dist, ranked);
+          else {
+            const weights = WEIGHTS[tr.type].slice(0, ranked.length);
+            const sumW = weights.reduce((a, b) => a + b, 0);
+            shares = weights.map(w => Math.floor(payable * w / sumW));
+          }
           const commission = Math.max(0, pool - shares.reduce((a, b) => a + b, 0) - TX_FEE);
           transfers = ranked.map((r, i) => ({ to: r.wallet, lamports: shares[i], rank: i + 1 }));
           transfers.push({ to: env.COMMISSION_ADDRESS, lamports: commission, rank: 0 });
@@ -503,29 +698,14 @@ async function settle(env) {
         }
         transfers = transfers.filter(t => t.lamports > 0);
 
-        let sig = 'DRY_RUN';
-        if (env.DRY_RUN !== '1') {
-          const kp = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(env.POOL_SECRET)));
-          const blockhash = (await rpc(env, 'getLatestBlockhash', [{ commitment: 'confirmed' }])).result?.value?.blockhash;
-          if (!blockhash) throw new Error('Failed to fetch blockhash for payout');
-          const tx = new Transaction();
-          tx.recentBlockhash = blockhash;
-          tx.feePayer = kp.publicKey;
-          for (const ix of await buildPayoutIxs(env, kp, tr, transfers)) tx.add(ix);
-          tx.sign(kp);
-          let bin = ''; for (const b of tx.serialize()) bin += String.fromCharCode(b);
-          const sendJson = await rpc(env, 'sendTransaction', [btoa(bin), { encoding: 'base64', preflightCommitment: 'confirmed' }]);
-          if (sendJson.error) throw new Error('sendTransaction: ' + JSON.stringify(sendJson.error));
-          sig = sendJson.result;
-          if (!sig) throw new Error('sendTransaction returned no signature');
-        }
+        const sig = await sendTransfers(env, tr, transfers, 'payout');
         for (const t of transfers) {
           await env.DB.prepare(`INSERT INTO payouts (tournament_id, rank, wallet, lamports, tx_sig, paid_at) VALUES (?,?,?,?,?,?)`)
             .bind(tr.id, t.rank, t.to, t.lamports, sig, now()).run();
         }
         report.push({ id: tr.id, currency: tr.currency, pool, winners: ranked.length, sig });
-        await tgBildir(env, `💰 TURNUVA KAPANDI\n${tr.id}\nHavuz: ${fmtAmount(pool, tr.currency)} · ${ranked.length} kazanan\nTx: ${sig}`);
-        if (ranked.length > 0 && env.DRY_RUN !== '1') {
+        await tgBildir(env, `💰 ${duel ? 'DÜELLO' : 'TURNUVA'} KAPANDI\n${tr.id}\nHavuz: ${fmtAmount(pool, tr.currency)} · ${ranked.length} kazanan\nTx: ${sig}`);
+        if (ranked.length > 0 && env.DRY_RUN !== '1' && !duel) {
           const oyun = OYUN_AD[tr.id.split(':')[0]] || tr.id.split(':')[0];
           const bir = transfers.find(x => x.rank === 1);
           const kz = ranked[0].wallet;
@@ -539,11 +719,112 @@ async function settle(env) {
       }
       await env.DB.prepare(`UPDATE tournaments SET status='paid' WHERE id=?`).bind(tr.id).run();
     } catch (e) {
-      await env.DB.prepare(`UPDATE tournaments SET status='open' WHERE id=?`).bind(tr.id).run(); // retry next hour
+      await env.DB.prepare(`UPDATE tournaments SET status=? WHERE id=? AND status='settling'`).bind(wasStatus, tr.id).run(); // retry next tick
       report.push({ id: tr.id, error: String(e) });
     }
   }
   return report;
+}
+
+// ---- DUEL / ROOM API ----
+function duelView(tr, duel, entries, wallet) {
+  const scored = entries.filter(e => e.best_score > 0).length;
+  const me = wallet ? entries.find(e => e.wallet === wallet) : null;
+  return {
+    id: tr.id, code: tr.id.split(':')[2], game: tr.game, currency: tr.currency, status: tr.status,
+    stake: tr.fee_lamports, feePct: feePctFor(tr), pool: entries.reduce((a, e) => a + e.paid_lamports, 0),
+    players: entries.length, maxPlayers: duel.max_players,
+    joinEndsAt: duel.join_ends_at, liveAt: duel.live_at, joinMs: duel.join_ms, playMs: duel.play_ms, endsAt: tr.status === 'live' || tr.status === 'paid' ? tr.ends_at : null,
+    dist: duel.dist, distLabel: DUEL_DIST[duel.dist], weights: duelWeights(duel.dist, Math.max(1, scored || Math.max(1, entries.length))),
+    visibility: duel.visibility, createdBy: duel.created_by, createdAt: duel.created_at,
+    entries: entries.map(e => ({ wallet: e.wallet, joinedAt: e.joined_at, played: e.attempts_used > 0, score: e.best_score, verified: !!e.best_verified })),
+    me: me ? { attemptsUsed: me.attempts_used, attemptsMax: 1, bestScore: me.best_score } : null,
+  };
+}
+async function duelEntries(env, id) {
+  return (await env.DB.prepare(`SELECT wallet, joined_at, paid_lamports, attempts_used, best_score, best_verified FROM entries WHERE tournament_id=? ORDER BY best_score DESC, best_at ASC, joined_at ASC`).bind(id).all()).results;
+}
+
+// POST /duel/create — reserves a room; the creator then pays the stake (memo = room id) and calls /join.
+async function handleDuelCreate(env, body) {
+  const { game, currency = 'SOL', stake, players, joinMin, playMin, dist = 'wta', visibility = 'private', wallet } = body || {};
+  if (!GAMES[game]) return bad('Unknown game');
+  if (!wallet) return bad('wallet required');
+  if (!['SOL', 'SKR'].includes(currency) || (currency === 'SKR' && !skrEnabled(env))) return bad('Unsupported currency');
+  const st = Number(stake);
+  if (!Number.isInteger(st) || st < DUEL_STAKE[currency].min || st > DUEL_STAKE[currency].max) return bad(`Stake out of range (${fmtAmount(DUEL_STAKE[currency].min, currency)} – ${fmtAmount(DUEL_STAKE[currency].max, currency)})`);
+  const n = Number(players);
+  if (!Number.isInteger(n) || n < DUEL_PLAYERS.min || n > DUEL_PLAYERS.max) return bad('players must be 2–10');
+  if (!DUEL_WINDOWS_MIN.includes(Number(joinMin)) || !DUEL_WINDOWS_MIN.includes(Number(playMin))) return bad('joinMin/playMin must be one of ' + DUEL_WINDOWS_MIN.join(','));
+  if (!DUEL_DIST[dist]) return bad('dist must be wta|top2|top3|half');
+  if (!['public', 'private'].includes(visibility)) return bad('visibility must be public|private');
+  if (dist === 'top2' && n < 2 || dist === 'top3' && n < 3) return bad('Distribution needs more players');
+
+  const t = now();
+  let id = null;
+  for (let i = 0; i < 5 && !id; i++) {
+    const cand = `${game}:x:${duelCode()}`;
+    try {
+      await env.DB.prepare(`INSERT INTO tournaments (id, game, type, starts_at, ends_at, fee_lamports, currency, status) VALUES (?,?,?,?,?,?,?,'pending')`)
+        .bind(cand, game, 'x', t, t + Number(joinMin) * 60000, st, currency).run();
+      id = cand;
+    } catch (_) { /* code collision → retry */ }
+  }
+  if (!id) return bad('Could not allocate a room code, try again', 500);
+  await env.DB.prepare(`INSERT INTO duels (id, max_players, join_ms, play_ms, join_ends_at, dist, visibility, created_by, created_at) VALUES (?,?,?,?,?,?,?,?,?)`)
+    .bind(id, n, Number(joinMin) * 60000, Number(playMin) * 60000, t + Number(joinMin) * 60000, dist, visibility, wallet, t).run();
+  return J({
+    ok: true, id, code: id.split(':')[2], memo: id, stake: st, currency, poolAddress: env.POOL_ADDRESS,
+    skr: currency === 'SKR' ? { mint: env.SKR_MINT, decimals: SKR_DECIMALS, poolTokenAccount: ataFor(env.POOL_ADDRESS, env.SKR_MINT).toBase58() } : null,
+    expiresAt: t + DUEL_PENDING_MS, feePct: DUEL_FEE_PCT[currency],
+  });
+}
+
+// GET /duel/list?game=&wallet= — public rooms open for joining + the caller's own rooms (open/live/recently finished)
+async function handleDuelList(env, url) {
+  const game = url.searchParams.get('game');
+  const wallet = url.searchParams.get('wallet');
+  const t = now();
+  const pub = (await env.DB.prepare(
+    `SELECT t.*, d.* FROM tournaments t JOIN duels d ON d.id=t.id
+      WHERE t.type='x' AND t.status='open' AND d.visibility='public' AND d.join_ends_at>? ${game ? 'AND t.game=?' : ''}
+      ORDER BY d.join_ends_at ASC LIMIT 50`
+  ).bind(...(game ? [t, game] : [t])).all()).results;
+  const out = { public: [], mine: [] };
+  for (const r of pub) out.public.push(duelView(r, r, await duelEntries(env, r.id), wallet));
+  if (wallet) {
+    const mine = (await env.DB.prepare(
+      `SELECT t.*, d.* FROM tournaments t JOIN duels d ON d.id=t.id JOIN entries e ON e.tournament_id=t.id AND e.wallet=?
+        WHERE t.type='x' AND (t.status IN ('open','live','settling') OR (t.status IN ('paid','cancelled') AND t.ends_at>?)) ${game ? 'AND t.game=?' : ''}
+        ORDER BY t.ends_at DESC LIMIT 30`
+    ).bind(...(game ? [wallet, t - 7 * 86400_000, game] : [wallet, t - 7 * 86400_000])).all()).results;
+    for (const r of mine) out.mine.push(duelView(r, r, await duelEntries(env, r.id), wallet));
+  }
+  out.public = out.public.filter(v => v.players < v.maxPlayers);
+  return J({ ...out, prices: await getPrices(env), limits: { stake: DUEL_STAKE, players: DUEL_PLAYERS, windowsMin: DUEL_WINDOWS_MIN, dist: DUEL_DIST, feePct: DUEL_FEE_PCT },
+             poolAddress: env.POOL_ADDRESS,
+             skr: skrEnabled(env) ? { mint: env.SKR_MINT, decimals: SKR_DECIMALS, poolTokenAccount: ataFor(env.POOL_ADDRESS, env.SKR_MINT).toBase58() } : null });
+}
+
+// GET /duel/get?id=<game:x:CODE>  or  ?game=&code=  — one room, with entries, live scores and payouts
+async function handleDuelGet(env, url) {
+  let id = url.searchParams.get('id');
+  const code = url.searchParams.get('code'), game = url.searchParams.get('game');
+  if (!id && code && game) id = `${game}:x:${String(code).toUpperCase().trim()}`;
+  if (!id) return bad('id or game+code required');
+  const tr = await env.DB.prepare(`SELECT * FROM tournaments WHERE id=? AND type='x'`).bind(id).first();
+  const duel = tr ? await env.DB.prepare(`SELECT * FROM duels WHERE id=?`).bind(id).first() : null;
+  if (!tr || !duel) return bad('Room not found', 404);
+  const wallet = url.searchParams.get('wallet');
+  const entries = await duelEntries(env, id);
+  const payouts = (await env.DB.prepare(`SELECT rank, wallet, lamports, tx_sig, paid_at FROM payouts WHERE tournament_id=? ORDER BY rank`).bind(id).all()).results;
+  return J({
+    ...duelView(tr, duel, entries, wallet), now: now(), prices: await getPrices(env),
+    payouts: payouts.map(p => ({ rank: p.rank, role: p.rank === 0 ? 'service_fee' : (p.rank < 0 ? 'refund' : 'prize'), wallet: p.wallet, amount: p.lamports, txSig: p.tx_sig,
+                                 explorer: p.tx_sig && p.tx_sig !== 'DRY_RUN' ? `https://solscan.io/tx/${p.tx_sig}` : null })),
+    poolAddress: env.POOL_ADDRESS,
+    skr: tr.currency === 'SKR' ? { mint: env.SKR_MINT, decimals: SKR_DECIMALS, poolTokenAccount: ataFor(env.POOL_ADDRESS, env.SKR_MINT).toBase58() } : null,
+  });
 }
 
 // ---- Router ----
@@ -558,9 +839,12 @@ export default {
       if (req.method === 'POST' && url.pathname === '/attempt/submit') return await handleSubmit(env, await req.json());
       if (req.method === 'GET' && url.pathname === '/leaderboard') return await handleLeaderboard(env, url);
       if (req.method === 'GET' && url.pathname === '/proof') return await handleProof(env, url);
+      if (req.method === 'POST' && url.pathname === '/duel/create') return await handleDuelCreate(env, await req.json());
+      if (req.method === 'GET' && url.pathname === '/duel/list') return await handleDuelList(env, url);
+      if (req.method === 'GET' && url.pathname === '/duel/get') return await handleDuelGet(env, url);
 
       if (url.searchParams.get('key') === env.ADMIN_KEY) {
-        if (url.pathname === '/admin/settle') return J(await settle(env));
+        if (url.pathname === '/admin/settle') return J({ duels: await duelTick(env), settle: await settle(env) });
         if (url.pathname === '/admin/diag') {
           let secretOk = false, secretLen = 0, secretErr = null;
           try { const a = JSON.parse(env.POOL_SECRET || ''); secretOk = Array.isArray(a); secretLen = a.length; } catch (e) { secretErr = String(e); }
@@ -568,13 +852,16 @@ export default {
                      skr: skrEnabled(env) ? { mint: env.SKR_MINT, poolAta: ataFor(env.POOL_ADDRESS, env.SKR_MINT).toBase58() } : null });
         }
         if (url.pathname === '/admin/pool') {
-          const sol = (await rpc(env, 'getBalance', [env.POOL_ADDRESS])).result?.value;
-          let skr = null;
+          const bal = await rpc(env, 'getBalance', [env.POOL_ADDRESS]);
+          let skr = null, skrErr = null;
           if (skrEnabled(env)) {
-            const j = await rpc(env, 'getTokenAccountBalance', [ataFor(env.POOL_ADDRESS, env.SKR_MINT).toBase58()]);
-            skr = j.result?.value?.uiAmountString ?? (j.error ? 'no ATA yet' : null);
+            // getAccountInfo(jsonParsed) is supported by every provider; getTokenAccountBalance is not.
+            const j = await rpc(env, 'getAccountInfo', [ataFor(env.POOL_ADDRESS, env.SKR_MINT).toBase58(), { encoding: 'jsonParsed', commitment: 'confirmed' }]);
+            skr = j.result?.value?.data?.parsed?.info?.tokenAmount?.uiAmountString ?? (j.result && !j.result.value ? 'no ATA yet' : null);
+            skrErr = j.error?.message ?? null;
           }
-          return J({ poolAddress: env.POOL_ADDRESS, balanceLamports: sol, skr });
+          return J({ poolAddress: env.POOL_ADDRESS, balanceLamports: bal.result?.value ?? null, rpcError: bal.error?.message ?? null,
+                     skr, skrError: skrErr, skrAta: skrEnabled(env) ? ataFor(env.POOL_ADDRESS, env.SKR_MINT).toBase58() : null });
         }
         if (url.pathname === '/admin/purgeall') {
           if (url.searchParams.get('confirm') !== 'yes') return bad('Add &confirm=yes to wipe ALL tournament data');
@@ -599,6 +886,7 @@ export default {
           return J({ text: metin, x: await xTweet(env, metin) });
         }
         if (url.pathname === '/admin/tweetdigest') { await xGunlukOzet(env); return J({ ok: true }); }
+        if (url.pathname === '/admin/prices') { _priceCache = { at: 0, prices: null }; return J(await getPrices(env)); }
       }
       return bad('Not found', 404);
     } catch (e) {
@@ -606,7 +894,9 @@ export default {
     }
   },
   async scheduled(ev, env, ctx) {
-    ctx.waitUntil(settle(env));
-    if (new Date(ev.scheduledTime).getUTCHours() === 18) ctx.waitUntil(xGunlukOzet(env)); // 21:05 TR
+    // Cron runs every 5 minutes (duel rooms): start/cancel rooms, then settle everything that ended.
+    ctx.waitUntil((async () => { await duelTick(env); await settle(env); })());
+    const d = new Date(ev.scheduledTime);
+    if (d.getUTCHours() === 18 && d.getUTCMinutes() < 5) ctx.waitUntil(xGunlukOzet(env)); // 21:0x TR, once a day
   },
 };

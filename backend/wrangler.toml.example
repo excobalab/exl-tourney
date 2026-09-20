@@ -10,11 +10,13 @@ database_name = "exl-tournaments"
 database_id = "YOUR_D1_DATABASE_ID"
 
 [triggers]
-crons = ["5 * * * *"]   # every hour at :05 — settle finished tournaments and pay out
+crons = ["*/5 * * * *"]   # every 5 min — start/cancel duel rooms, settle finished tournaments, pay out
 
 [vars]
 # "1" = simulate payouts (no on-chain transfer). Set to "0" only after an end-to-end test.
 DRY_RUN = "1"
+# Comma-separated list = failover order. api.mainnet-beta.solana.com rejects Cloudflare Workers (403) — use a
+# free Helius/QuickNode/Triton endpoint instead, e.g. "https://mainnet.helius-rpc.com/?api-key=XXX,https://solana-rpc.publicnode.com"
 RPC_URL = "https://solana-rpc.publicnode.com"
 # PUBLIC address of the prize-pool wallet (generate with tools/pool_wallet.html)
 POOL_ADDRESS = "YOUR_POOL_WALLET_PUBLIC_KEY"
