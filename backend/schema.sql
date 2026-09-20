@@ -1,11 +1,12 @@
--- EXL Tournaments — D1 şema v1
+-- EXL Tournaments — D1 schema v2 (fresh install). Existing v1 databases: run migrations/0002_skr_and_signatures.sql instead.
 CREATE TABLE IF NOT EXISTS tournaments (
   id TEXT PRIMARY KEY,              -- zipla:d:2026-07-12 | zipla:w:2026-W28 | zipla:m:2026-07
   game TEXT NOT NULL,
   type TEXT NOT NULL,               -- d | w | m
   starts_at INTEGER NOT NULL,       -- unix ms (UTC)
   ends_at INTEGER NOT NULL,
-  fee_lamports INTEGER NOT NULL,
+  fee_lamports INTEGER NOT NULL,    -- base units of `currency` (lamports for SOL, 1e-6 SKR for SKR)
+  currency TEXT NOT NULL DEFAULT 'SOL',  -- SOL | SKR
   status TEXT NOT NULL DEFAULT 'open'   -- open | settling | paid
 );
 
@@ -19,6 +20,7 @@ CREATE TABLE IF NOT EXISTS entries (
   attempts_used INTEGER NOT NULL DEFAULT 0,
   best_score INTEGER NOT NULL DEFAULT 0,
   best_at INTEGER,
+  best_verified INTEGER NOT NULL DEFAULT 0,  -- best score carried a valid wallet signature
   UNIQUE(tournament_id, wallet)
 );
 
@@ -31,7 +33,9 @@ CREATE TABLE IF NOT EXISTS attempts (
   duration_ms INTEGER,
   taps INTEGER,
   flagged INTEGER NOT NULL DEFAULT 0,
-  telemetry_json TEXT
+  telemetry_json TEXT,
+  sig TEXT,                          -- base58 ed25519 signature over exl:score:<token>:<score>:<durationMs>
+  verified INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS payouts (

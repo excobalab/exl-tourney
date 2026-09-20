@@ -20,6 +20,10 @@ RPC_URL = "https://solana-rpc.publicnode.com"
 POOL_ADDRESS = "YOUR_POOL_WALLET_PUBLIC_KEY"
 # Wallet that receives the service fee (1/3/5 %)
 COMMISSION_ADDRESS = "YOUR_FEE_WALLET_PUBLIC_KEY"
+# SKR tournaments (leave empty to disable). Seeker token mint, classic SPL Token program, 6 decimals.
+SKR_MINT = "SKRbvo6Gf7GondiT3BbTfuRDPqLWei4j2Qy2NPGZhW3"
+# "1" = low-fee launch tournaments (0.01 SOL / 50 SKR daily) for onboarding; "0" = real fees
+LAUNCH_MODE = "0"
 
 # SECRETS (never commit):
 #   npx wrangler secret put POOL_SECRET   -> pool wallet secret key as JSON array ([12,34,...] 64 numbers)

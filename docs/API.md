@@ -2,9 +2,9 @@
 
 Base URL: your Worker (`https://exl-tournaments.<account>.workers.dev`). All responses are JSON with permissive CORS. Times are Unix ms (UTC). Amounts are lamports.
 
-## GET /t?game=<gameId>&wallet=<pubkey?>
+## GET /t?game=<gameId>&wallet=<pubkey?>&skr=1
 
-Ensures the current daily / weekly / monthly tournaments exist for the game and returns the open ones.
+Ensures the current daily / weekly / monthly tournaments exist for the game and returns the open ones. Pass `skr=1` to also receive the parallel SKR tournaments (ids end with `:skr`, `currency: "SKR"`, `feeAmount` in 1e-6 SKR) plus an `skr` object with `mint`, `decimals` and the pool's `poolTokenAccount`. Clients that don't send `skr=1` only ever see SOL tournaments.
 
 ```json
 {
