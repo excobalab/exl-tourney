@@ -519,7 +519,7 @@ async function handleProof(env, url) {
     })),
     rules: duel
       ? 'Room rules: one attempt each, same seed for everyone, the playing clock starts for all players at once; ties split the prize equally; flagged scores never rank; fewer than 2 players or no valid score → full refund minus the on-chain fee; the payout transaction fee is deducted from the service fee, never from prizes.'
-      : 'Same server seed for every participant; ties → earlier submission wins; flagged scores never rank; the payout transaction fee is deducted from the service fee, never from prizes.',
+      : 'Same server seed for every participant; ties → earlier submission wins; flagged scores never rank; no valid score in the period → every entry is refunded; the payout transaction fee is deducted from the service fee, never from prizes.',
   });
 }
 
@@ -603,8 +603,8 @@ async function duelGoLive(env, id, playMs) {
   return !!r.meta.changes;
 }
 
-// Full refund to every entry (minus the on-chain tx fee, split evenly on SOL rooms); room → cancelled.
-async function duelRefund(env, tr, reason) {
+// Full refund to every entry (minus the on-chain tx fee, split evenly on SOL); tournament/room → cancelled.
+async function refundAll(env, tr, reason) {
   const entries = (await env.DB.prepare(`SELECT wallet, paid_lamports FROM entries WHERE tournament_id=?`).bind(tr.id).all()).results;
   let sig = null;
   if (entries.length) {
@@ -617,9 +617,10 @@ async function duelRefund(env, tr, reason) {
     }
   }
   await env.DB.prepare(`UPDATE tournaments SET status='cancelled' WHERE id=?`).bind(tr.id).run();
-  await tgBildir(env, `↩️ DÜELLO İPTAL (${reason})\n${tr.id}\n${entries.length} iade · tx ${sig}`);
+  await tgBildir(env, `↩️ ${isDuel(tr) ? 'DÜELLO İPTAL' : 'TURNUVA İADE'} (${reason})\n${tr.id}\n${entries.length} iade · tx ${sig}`);
   return { id: tr.id, cancelled: reason, refunds: entries.length, sig };
 }
+const duelRefund = refundAll;
 
 // Runs every cron tick: expire unpaid reservations, start or cancel rooms whose joining window closed.
 async function duelTick(env) {
@@ -671,9 +672,11 @@ async function settle(env) {
       ).bind(tr.id).all()).results;
       const duel = isDuel(tr) ? await env.DB.prepare(`SELECT * FROM duels WHERE id=?`).bind(tr.id).first() : null;
 
-      if (duel && ranked.length === 0) {
-        // Nobody played → everyone gets their stake back (minus the on-chain fee)
-        report.push(await duelRefund(env, tr, 'no valid score'));
+      if (ranked.length === 0 && pool > 0) {
+        // No valid score (nobody played, or every score flagged/unsubmitted) → everyone gets their entry back
+        // (minus the on-chain fee). Applies to duel rooms AND scheduled tournaments — the house never keeps
+        // a pool it did not pay a prize from. (v3.2; before this, a scheduled pool with no ranked score went to the service wallet.)
+        report.push(await refundAll(env, tr, 'no valid score'));
         continue;
       }
       if (pool > 0) {

@@ -20,12 +20,19 @@ Most "play-to-earn" leaderboards are luck-weighted, opaque, or need a custodial 
 ## What's in this repo
 
 ```
-backend/              Cloudflare Worker (API + cron settle) + D1 schema
-flutter/exl_wallet/   Flutter payment sheet (MWA + Phantom) + the Kotlin MWA bridge
-                      exl_wallet.dart   fixed-amount payment with memo (tournament entry)
-                      exl_premium.dart  one-time $2.99 premium unlock (same rails, USD→SOL via CoinGecko)
-docs/                 API, tournament model, anti-cheat, SKR integration
+backend/src/index.js        Cloudflare Worker: API, cron settle/payout, duel rooms, proof, Jupiter USD prices (v3.2)
+backend/schema.sql          D1 schema (tournaments, duels, entries, attempts, payouts) + migrations/
+backend/scripts/            LOCAL_SETTLE.md — reproduce a payout / refund locally in DRY_RUN
+flutter/exl_wallet/         Drop-in Flutter modules + Kotlin MWA bridge
+  exl_wallet.dart           payment sheet: MWA 2.0 (Seed Vault, Jupiter, Solflare, Backpack) + Phantom deeplink; SOL and SKR (SPL)
+  exl_duel.dart             DUELS tab: create-room wizard, join with code, room screen, rematch
+  exl_proof.dart            PROOF screen: seed commitment / reveal, verified ranking, payout tx links
+  exl_premium.dart          one-time premium unlock on the same rails
+  android/MainActivity.kt   MWA bridge (signAndSendTransactions, signMessages)
+docs/                       API.md · DUELS.md · SKR.md · TOURNAMENT_MODEL.md · ANTI_CHEAT.md · EVIDENCE.md (mainnet tx map) · deck/
 ```
+
+**Evidence:** every claim below maps to a mainnet transaction — see [`docs/EVIDENCE.md`](docs/EVIDENCE.md). Demo video: https://www.youtube.com/watch?v=h5Us_DjI_eQ · Deck: [`docs/deck/EXL_Tourney_Pitch_Deck.pdf`](docs/deck/EXL_Tourney_Pitch_Deck.pdf)
 
 ## How it works
 
@@ -92,9 +99,13 @@ Details and accepted risks: `docs/ANTI_CHEAT.md`.
 
 - **SKR tournaments** — entry and prize pool in SKR (`SKRbvo6Gf7GondiT3BbTfuRDPqLWei4j2Qy2NPGZhW3`), SPL transfer verification + ATA payouts. See `docs/SKR.md`.
 - **Wallet-signed scores** — the Seed Vault / wallet signs `exl:score:<token>:<score>:<duration>` (MWA `signMessages`, Phantom `signMessage`); the Worker verifies ed25519 and marks the score "verified" on the leaderboard.
-- **Proof screen** — one page per finished tournament: seed hash, ranking, every payout with its Solscan link, fee breakdown. In-app and at `web3.excobalab.com/proof/<id>`.
+- **Proof screen** — one page per finished tournament: seed hash, ranking, every payout with its Solscan link, fee breakdown. In-app and at `web3.excobalab.com/proof/?id=<id>`.
+- **Duel rooms (v2.0)** — players create their own rooms: SOL or SKR stake (0.02–5 SOL / 200–50,000 SKR), 2–10 players, joining and playing windows (15 min – 1 day), prize split (winner-takes-all / top 2 / top 3 / top half), invite code or public list. The room goes live when it is full (or at the end of the joining window with ≥ 2 players); everyone's clock starts at the same second; ties split; under-filled rooms and rooms with no valid score are **refunded automatically**. `docs/DUELS.md`.
+- **USD reference** next to every SOL/SKR amount (Jupiter price API, fetched server-side, 5-min cache). Payment is always in SOL/SKR.
+- **Refund guarantee (v3.2)** — a period that ends with no valid score refunds every entry, for scheduled tournaments and rooms alike. The house never keeps a pool it did not pay a prize from.
+- **First live results on mainnet (21 Sep 2026):** a 0.05 SOL duel between a Seeker and a regular Android phone settled itself — 0.097 SOL to the winner, tx [`4WGoRr…`](https://solscan.io/tx/4WGoRriJcacwDKZWZ3eTkBcDLEAaZVW5LdDSnhMgphZG4wYsthtBDz4WzmS48UtZbBMj8yteu68gP9p86Wqo9i7B); an under-filled 200 SKR room refunded itself, tx [`2rN8LN…`](https://solscan.io/tx/2rN8LN8Yf4XwiKVxhM6k3cTNCfFmSQptJEVEgmsLMuDZmAdtmSFDfmoLvHSn3pEPPCSuEg9DdVsxy2FoXmCAELXQ).
 
-Commit history in this repo starts on 2026-09-20; everything above is built during the hackathon window.
+Commit history in this repo starts on 2026-09-20; everything above is built during the hackathon window. The games themselves shipped on the dApp Store in July 2026. The team is one person working with an AI-native workflow (product decisions by the founder, code written with Claude, tested on device).
 
 ## Roadmap
 

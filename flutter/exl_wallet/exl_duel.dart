@@ -217,7 +217,8 @@ class DuelTabState extends State<DuelTab> {
     }
     if (_data == null) return const Center(child: CircularProgressIndicator(strokeWidth: 2, color: exlCyan));
     final mine = (_data!['mine'] as List).cast<Map>();
-    final pub = (_data!['public'] as List).cast<Map>();
+    // Rooms the player is already in belong under YOUR ROOMS only
+    final pub = (_data!['public'] as List).cast<Map>().where((r) => r['me'] == null).toList();
     final prices = _data!['prices'] as Map?;
     return RefreshIndicator(
       color: exlCyan, backgroundColor: exlPanel, onRefresh: load,
