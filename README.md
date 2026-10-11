@@ -20,12 +20,17 @@ Most "play-to-earn" leaderboards are luck-weighted, opaque, or need a custodial 
 ## What's in this repo
 
 ```
-backend/src/index.js        Cloudflare Worker: API, cron settle/payout, duel rooms, proof, Jupiter USD prices (v3.2)
+backend/src/index.js        Cloudflare Worker: API, cron settle/payout, seat-mode duel rooms, withdraw (instant on-chain refund), proof, Jupiter USD prices (v4.3)
 backend/schema.sql          D1 schema (tournaments, duels, entries, attempts, payouts) + migrations/
 backend/scripts/            LOCAL_SETTLE.md — reproduce a payout / refund locally in DRY_RUN
 flutter/exl_wallet/         Drop-in Flutter modules + Kotlin MWA bridge
   exl_wallet.dart           payment sheet: MWA 2.0 (Seed Vault, Jupiter, Solflare, Backpack) + Phantom deeplink; SOL and SKR (SPL)
-  exl_duel.dart             DUELS tab: create-room wizard, join with code, room screen, rematch
+  exl_duel.dart             DUELS: create room (no payment), join with code, public rooms + history, seat-mode room (pay from your seat, nudge, host START, WITHDRAW, CLOSE ROOM, REMATCH)
+  exl_troom.dart            tournament room (PAY / PLAY / WITHDRAW) + one-page SOL|SKR tournament grid
+  exl_mywallet.dart         WALLET page: open entries/seats across games + on-chain history (no custodial balance)
+  exl_ui.dart               shared 3D UI kit (embossed titles, buttons, pills, step strip, HOW IT WORKS sheet, retry dialog)
+  exl_countdown.dart        TAP TO START → 3-2-1 → GO (the attempt is burned on GO, not before)
+  exl_pending.dart          offline-safe score queue (the running score is snapshotted every 2 s — a left or crashed run submits the score reached)
   exl_proof.dart            PROOF screen: seed commitment / reveal, verified ranking, payout tx links
   exl_premium.dart          one-time premium unlock on the same rails
   android/MainActivity.kt   MWA bridge (signAndSendTransactions, signMessages)

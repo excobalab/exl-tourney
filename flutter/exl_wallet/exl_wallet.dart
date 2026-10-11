@@ -32,6 +32,7 @@ import 'package:url_launcher/url_launcher.dart';
 
 // ---- EXCOBALAB sabitleri ----
 const String exlSiteUrl = 'https://excobalab.com';
+const String exlWeb3Url = 'https://web3.excobalab.com'; // v1.3: footer link → EXL Tourney web3 hub (proof, deck, rooms)
 const String exlRpcUrl = 'https://solana-rpc.publicnode.com';
 const String exlWsUrl = 'wss://solana-rpc.publicnode.com';
 const MethodChannel exlMwa = MethodChannel('exl/mwa');
@@ -106,6 +107,9 @@ Future<SignResult?> showExlSignSheet(
   required String message,
   required int score,
   String preferRail = 'mwa',
+  String? title,      // v1.3: reuse the sheet for non-score signatures (e.g. "SIGN TO TAKE A SEAT")
+  String? body,
+  String? skipLabel,  // null → default "SUBMIT WITHOUT SIGNATURE"; '' → no skip link (signature required)
 }) {
   return showModalBottomSheet<SignResult>(
     context: context,
@@ -113,7 +117,8 @@ Future<SignResult?> showExlSignSheet(
     isScrollControlled: true,
     isDismissible: true,
     builder: (_) => _ExlSignSheet(
-        appName: appName, phantomScheme: phantomScheme, message: message, score: score, preferRail: preferRail),
+        appName: appName, phantomScheme: phantomScheme, message: message, score: score, preferRail: preferRail,
+        title: title, body: body, skipLabel: skipLabel),
   );
 }
 
@@ -603,8 +608,10 @@ class _ExlPaySheetState extends State<_ExlPaySheet> {
 class _ExlSignSheet extends StatefulWidget {
   final String appName, phantomScheme, message, preferRail;
   final int score;
+  final String? title, body, skipLabel;
   const _ExlSignSheet(
-      {required this.appName, required this.phantomScheme, required this.message, required this.score, required this.preferRail});
+      {required this.appName, required this.phantomScheme, required this.message, required this.score, required this.preferRail,
+       this.title, this.body, this.skipLabel});
   @override
   State<_ExlSignSheet> createState() => _ExlSignSheetState();
 }
@@ -757,11 +764,11 @@ class _ExlSignSheetState extends State<_ExlSignSheet> {
         const SizedBox(height: 20),
         const ExBadge(size: 48),
         const SizedBox(height: 14),
-        const Text('SIGN YOUR SCORE',
-            style: TextStyle(color: exlCyan, fontSize: 16, fontWeight: FontWeight.w800, letterSpacing: 2)),
+        Text(widget.title ?? 'SIGN YOUR SCORE',
+            style: const TextStyle(color: exlCyan, fontSize: 16, fontWeight: FontWeight.w800, letterSpacing: 2)),
         const SizedBox(height: 8),
-        Text('Score ${widget.score} — your wallet signs it so nobody can submit on your behalf. '
-            'Verified scores get a ✓ badge on the leaderboard and in the tournament proof.',
+        Text(widget.body ?? ('Score ${widget.score} — your wallet signs it so nobody can submit on your behalf. '
+            'Verified scores get a ✓ badge on the leaderboard and in the tournament proof.'),
             textAlign: TextAlign.center, style: const TextStyle(color: exlIce, fontSize: 13, height: 1.5)),
         const SizedBox(height: 18),
         if (_busy)
@@ -781,10 +788,11 @@ class _ExlSignSheetState extends State<_ExlSignSheet> {
           Text(_error!, textAlign: TextAlign.center, style: const TextStyle(color: Color(0xFFFF8A8A), fontSize: 12, height: 1.4)),
         ],
         const SizedBox(height: 14),
-        GestureDetector(
-          onTap: _busy ? null : () => Navigator.of(context).pop(),
-          child: const Text('SUBMIT WITHOUT SIGNATURE', style: TextStyle(color: exlCyanDim, fontSize: 12, letterSpacing: 1.5)),
-        ),
+        if (widget.skipLabel != '')
+          GestureDetector(
+            onTap: _busy ? null : () => Navigator.of(context).pop(),
+            child: Text(widget.skipLabel ?? 'SUBMIT WITHOUT SIGNATURE', style: const TextStyle(color: exlCyanDim, fontSize: 12, letterSpacing: 1.5)),
+          ),
       ]),
     );
   }
@@ -828,7 +836,7 @@ class ExlSiteLink extends StatelessWidget {
 
   Future<void> _open() async {
     try {
-      await launchUrl(Uri.parse(exlSiteUrl), mode: LaunchMode.externalApplication);
+      await launchUrl(Uri.parse(exlWeb3Url), mode: LaunchMode.externalApplication);
     } catch (_) {}
   }
 
@@ -843,12 +851,12 @@ class ExlSiteLink extends StatelessWidget {
           children: [
             ExBadge(size: 18),
             SizedBox(width: 8),
-            Text('EXCOBALAB.COM',
+            Text('WEB3.EXCOBALAB.COM',
                 style: TextStyle(
+                    fontFamily: 'Paytone',
                     color: exlCyanDim,
                     fontSize: 11,
-                    fontWeight: FontWeight.w600,
-                    letterSpacing: 3)),
+                    letterSpacing: 2.5)),
           ],
         ),
       ),

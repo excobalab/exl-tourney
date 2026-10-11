@@ -16,3 +16,13 @@
 - Timezone: UTC on the server; the app shows local time.
 
 Terms shown to the player before the first JOIN: 18+, skill-based, same seed for everyone, fees 1–5 %, prizes paid on-chain automatically, refunds only when a period ends with no valid score. Terms/privacy pages per game: `https://excobalab.com/terms/<game>.html`, `/privacy/<game>.html`.
+
+## v3.3 / client 1.2.1 (1 Oct 2026)
+- **Attempt starts on GO.** The client calls `/attempt/start` only after the player taps *TAP TO START* and the 3-2-1 countdown ends; backing out before GO spends nothing. An attempt that was started but never submitted (app killed, crash) is submitted as **0** by the client on the next launch — the attempt is spent either way, so there is no replay window.
+- **Duplicate entry payment → refunded once.** If a wallet pays a second time for a tournament it already joined, `/join` verifies the payment, records it in `dup_refunds` (pay_tx is the primary key) and sends it back immediately (SOL: minus the 5 000-lamport network fee). Uniqueness is per tournament id — the same wallet can still enter every other tournament and room once.
+
+### v4.2 — late finish grace (6 Oct 2026)
+A run that started before `ends_at` counts even if it finishes after it: `settle()` defers a tournament/room while an attempt is open (started, not submitted, started within the last 15 min) and the window closed less than 15 min ago. `/attempt/start` still requires `ends_at > now`.
+
+## Sol EXathlon (v5, 7 Oct 2026) — a standalone app on the same model
+One entry (daily / weekly / monthly, SOL or SKR, same fees and prize tables) covers four games: Sol Jump, Sol Dodge, Sol Stack, Sol Tiles. The player picks a game (CHOOSE GAME), spends one of that game's attempts (daily 1 · weekly 3 · monthly 10 per game), and the best score per game is ranked against the other players; each game's ranking pays F1 points 25-18-15-12-10-8-6-4-2-1. Total points rank the EXathlon board; ties go to fewer total rank places, then the earlier finish. Duel rooms work the same way with one run per game. Withdraw is allowed until the first run in any game; a left run counts with the score reached. Every rule of the single-game apps applies unchanged; the EXathlon app contains the four game engines and the shared EXL kit.

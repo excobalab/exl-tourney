@@ -12,6 +12,7 @@ import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:url_launcher/url_launcher.dart';
 
+import 'exl_ui.dart';
 import 'exl_wallet.dart';
 
 class ProofScreen extends StatefulWidget {
@@ -80,8 +81,7 @@ class _ProofScreenState extends State<ProofScreen> {
       appBar: AppBar(
         backgroundColor: Colors.transparent,
         centerTitle: true,
-        title: const Text('PROOF',
-            style: TextStyle(color: exlCyan, fontSize: 16, fontWeight: FontWeight.w700, letterSpacing: 4)),
+        title: const ExlEmboss('PROOF', size: 20, spacing: 3),
         actions: [
           IconButton(
               onPressed: () => _open('https://web3.excobalab.com/proof/?id=${Uri.encodeComponent(widget.tournamentId)}'),
@@ -123,7 +123,9 @@ class _ProofScreenState extends State<ProofScreen> {
     final pool = d['pool'] as num;
     final feePct = t['feePct'] as num;
     final type = t['type'] as String;
-    final typeName = type == 'd' ? 'DAILY' : (type == 'w' ? 'WEEKLY' : 'MONTHLY');
+    final typeName = type == 'd'
+        ? 'DAILY'
+        : (type == 'w' ? 'WEEKLY' : (type == 'm' ? 'MONTHLY' : (type == 'x' ? 'DUEL ROOM' : type.toUpperCase())));
 
     return ListView(
       padding: const EdgeInsets.fromLTRB(16, 8, 16, 28),

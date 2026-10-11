@@ -35,3 +35,5 @@ All seven engines already run on a fixed time step with seed-derived randomness.
 2. `confirmed` commitment for payment verification (not `finalized`) — chosen for UX; reorg risk on Solana mainnet is negligible for these amounts.
 3. Single RPC provider (publicnode) with client-side retry; no failover yet.
 4. Hot pool wallet signed by the Worker; escrow program is the long-term answer.
+
+**Client rule since 1.3.0 (6 Oct 2026):** a run the player leaves (or that the app loses) is submitted with the score reached so far, not 0 — the client snapshots the running score every 2 s into its offline queue. No resume: a saved mid-run state would allow quit-before-death retries. Leaving can never beat continuing, so there is no incentive to abandon.
